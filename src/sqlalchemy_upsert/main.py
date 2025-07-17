@@ -10,9 +10,9 @@ import pandas as pd
 import re
 import time
 
-from collections import Counter
+# from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy import Engine, MetaData, Table
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import OperationalError
@@ -62,22 +62,51 @@ class PostgresqlUpsert:
             return pk_cols, [pk_cols] + unique_sets
         return pk_cols, unique_sets
 
-    def _conflict_aware_deduplicate(self, df: pd.DataFrame, constraints: List[List[str]]) -> pd.DataFrame:
-        for constraint in constraints:
-            if not all(col in df.columns for col in constraint):
-                logger.debug(f"Skipping constraint {constraint} — missing columns in DataFrame")
-                continue
+    def _check_conflicts_for_constraint(self, engine, df, table_name, constraint):
+        cols = constraint
+        df_subset = df[cols].drop_duplicates()
+        placeholders = ", ".join([f":{col}" for col in cols])
+        sql = f"""
+            SELECT {', '.join(cols)}
+            FROM {table_name}
+            WHERE ({', '.join(cols)}) IN (
+                SELECT {', '.join(cols)} FROM (VALUES
+                    {', '.join(['(' + ', '.join(['%s'] * len(cols)) + ')' for _ in range(len(df_subset))])}
+                ) AS v({', '.join(cols)})
+            )
+        """
+        values = [tuple(x) for x in df_subset.values]
+        with engine.begin() as conn:
+            result = conn.execute(text(sql), sum(values, ()))
+            existing = pd.DataFrame(result.fetchall(), columns=cols)
+        df_merged = df.merge(existing, on=cols, how="inner")
+        return df_merged.index.value_counts()
 
-            if not df.duplicated(subset=constraint, keep=False).any():
-                logger.debug(f"No duplicates found for constraint {constraint}")
-                continue
+    def remove_multi_conflict_rows_parallel(self, df, engine, table_name, unique_constraints, max_workers=4):
+        conflict_counts = pd.Series(0, index=df.index)
 
-            before = len(df)
-            df = df[~df.duplicated(subset=constraint, keep='last')]
-            after = len(df)
-            logger.debug(f"Removed {before - after} duplicates using constraint {constraint}")
+        def worker(constraint):
+            try:
+                return self._check_conflicts_for_constraint(engine, df, table_name, constraint)
+            except Exception as e:
+                logger.warning(f"Constraint {constraint} check failed: {e}")
+                return pd.Series(dtype=int)
 
-        return df
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(worker, c): c for c in unique_constraints}
+            for future in as_completed(futures):
+                try:
+                    counts = future.result()
+                    conflict_counts = conflict_counts.add(counts, fill_value=0)
+                except Exception as e:
+                    logger.error(f"Thread failed: {e}")
+
+        to_remove = conflict_counts[conflict_counts > 1].index
+        removed_df = df.loc[to_remove]
+        if not removed_df.empty:
+            logger.warning(f"{len(removed_df)} rows removed due to multiple unique constraint conflicts")
+            logger.debug(f"Removed rows:\n{removed_df}")
+        return df.drop(index=to_remove)
 
     def _do_upsert(self, chunk: pd.DataFrame, table: Table, pk_cols: List[str], valid_constraints: List[List[str]]):
         insert_stmt = insert(table).values(chunk.to_dict(orient="records"))
