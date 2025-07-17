@@ -1,0 +1,8 @@
+{
+    "python.defaultInterpreterPath": "/home/joao/.cache/pypoetry/virtualenvs/sqlalchemy-upsert-TTbREpJ7-py3.12",
+    "python.testing.pytestArgs": [
+        "tests"
+    ],
+    "python.testing.unittestEnabled": false,
+    "python.testing.pytestEnabled": true
+}
