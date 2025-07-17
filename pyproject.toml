@@ -1,7 +1,7 @@
 [project]
 name = "sqlalchemy_upsert"
 version = "0.1.0"
-description = "A project for upserting data from CSV files to PostgreSQL and dumping tables from MSSQL to CSV."
+description = "Upsert helper for PostgreSQL using SQLAlchemy."
 authors = [{name = "Joao Brito", email = "machado000@gmail.com"}]
 readme = "README.md"
 license = {text = "MIT"}
