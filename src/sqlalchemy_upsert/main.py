@@ -12,14 +12,13 @@ import time
 
 # from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, inspect, text, bindparam
 from sqlalchemy import Engine, MetaData, Table
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import OperationalError
 from tqdm import tqdm
-from typing import List, Tuple
+from typing import List, Tuple, Union
 from .config import PgConfig
-
 
 logger = logging.getLogger(__name__)
 logger.propagate = True
@@ -45,68 +44,124 @@ class PostgresqlUpsert:
         inspector = inspect(self.engine)
         return inspector.get_table_names()
 
-    def _get_constraints(self, df: pd.DataFrame,
-                         table: Table, schema: str = "public") -> Tuple[List[str], List[List[str]]]:
-        pk_cols = [col.name for col in table.primary_key.columns]
+    def _get_constraints(self, dataframe: pd.DataFrame,
+                         table_name: str, schema: str = "public") -> Tuple[List[str], List[List[str]]]:
+
+        if dataframe.empty:
+            logger.warning("Received empty DataFrame, skipping _get_constraints.")
+            return [], []
 
         inspector = inspect(self.engine)
-        uniques = inspector.get_unique_constraints(table.name, schema=schema)
+        pk_cols = inspector.get_pk_constraint(table_name, schema).get("constrained_columns", [])
+        uniques = inspector.get_unique_constraints(table_name, schema)
 
         unique_sets = [
             u["column_names"]
             for u in uniques
-            if all(col in df.columns for col in u["column_names"])
+            if all(col in dataframe.columns for col in u["column_names"])
         ]
 
-        if pk_cols and all(c in df.columns for c in pk_cols):
+        if pk_cols and all(c in dataframe.columns for c in pk_cols):
             return pk_cols, [pk_cols] + unique_sets
+
         return pk_cols, unique_sets
 
-    def _check_conflicts_for_constraint(self, engine, df, table_name, constraint):
-        cols = constraint
-        df_subset = df[cols].drop_duplicates()
-        placeholders = ", ".join([f":{col}" for col in cols])
-        sql = f"""
-            SELECT {', '.join(cols)}
-            FROM {table_name}
-            WHERE ({', '.join(cols)}) IN (
-                SELECT {', '.join(cols)} FROM (VALUES
-                    {', '.join(['(' + ', '.join(['%s'] * len(cols)) + ')' for _ in range(len(df_subset))])}
-                ) AS v({', '.join(cols)})
-            )
+    def _check_conflicts(self, dataframe: pd.DataFrame, constraint: Union[str, List[str]],
+                         table_name: str, schema: str = "public") -> pd.Index:
         """
-        values = [tuple(x) for x in df_subset.values]
-        with engine.begin() as conn:
-            result = conn.execute(text(sql), sum(values, ()))
-            existing = pd.DataFrame(result.fetchall(), columns=cols)
-        df_merged = df.merge(existing, on=cols, how="inner")
-        return df_merged.index.value_counts()
+        Return the index (pandas Index) of rows in the DataFrame that would conflict with existing rows in the table.
+        Uses SQLAlchemy parameter expansion for IN clauses.
+        """
 
-    def remove_multi_conflict_rows_parallel(self, df, engine, table_name, unique_constraints, max_workers=4):
-        conflict_counts = pd.Series(0, index=df.index)
+        cols = [constraint] if isinstance(constraint, str) else (constraint or [])
+        if not cols:
+            logger.warning("No constraint columns provided, skipping _check_conflicts.")
+            return pd.Index([])
+
+        inspector = inspect(self.engine)
+        table_columns = {col['name'] for col in inspector.get_columns(table_name, schema=schema)}
+
+        df_columns = set(dataframe.columns)
+        if not all(col in df_columns and col in table_columns for col in cols):
+            logger.warning(
+                f"Constraint {cols} columns not present in both DataFrame and table {schema}.{table_name}, skipping _check_conflicts.")
+            return pd.Index([])
+
+        df_subset = dataframe[cols]
+        if df_subset.empty:
+            logger.warning("Empty subset dataframe to check for conflicts, skipping _check_conflicts.")
+            return pd.Index([])
+
+        # Sanitize identifiers (basic)
+        safe_cols = [f'"{col}"' for col in cols]
+        safe_table = f'"{schema}"."{table_name}"'
+
+        if len(cols) == 1:
+            # Single-column constraint
+            vals = df_subset[cols[0]].tolist()
+            sql = text(f"""
+                SELECT DISTINCT {safe_cols[0]}
+                FROM {safe_table}
+                WHERE {safe_cols[0]} IN :vals
+            """).bindparams(bindparam('vals', expanding=True))
+        else:
+            # Multi-column constraint
+            vals = [tuple(row) for row in df_subset[cols].to_numpy()]
+            col_tuple = f"({', '.join(safe_cols)})"
+            sql = text(f"""
+                SELECT DISTINCT {', '.join(safe_cols)}
+                FROM {safe_table}
+                WHERE {col_tuple} IN :vals
+            """).bindparams(bindparam('vals', expanding=True))
+
+        with self.engine.connect() as conn:
+            result = conn.execute(sql, {'vals': vals})
+            existing = set(tuple(row) if len(cols) > 1 else (row[0],) for row in result.fetchall())
+
+        conflict_indices = df_subset[df_subset[cols].apply(tuple, axis=1).isin(existing)].index
+
+        return conflict_indices
+
+    def _remove_multi_conflict_rows(self, dataframe: pd.DataFrame, table_name: str, schema: str = "public",
+                                    max_workers: int = 4) -> pd.DataFrame:
+
+        if dataframe.empty:
+            logger.warning("Received empty Dataframe, skipping multi-conflict removal.")
+            return dataframe
+
+        _, uniques = self._get_constraints(dataframe, table_name, schema)
+        if not uniques:
+            logger.warning(f"No unique constraints found for table {table_name}, skipping multi-conflict removal.")
+            return dataframe
+
+        conflict_counts = pd.Series(0, index=dataframe.index)
 
         def worker(constraint):
             try:
-                return self._check_conflicts_for_constraint(engine, df, table_name, constraint)
+                return self._check_conflicts(dataframe,  constraint, table_name, schema)
             except Exception as e:
                 logger.warning(f"Constraint {constraint} check failed: {e}")
-                return pd.Series(dtype=int)
+                return pd.Index([])
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(worker, c): c for c in unique_constraints}
+            futures = {executor.submit(worker, c): c for c in uniques}
             for future in as_completed(futures):
                 try:
-                    counts = future.result()
-                    conflict_counts = conflict_counts.add(counts, fill_value=0)
+                    conflict_idx = future.result()
+                    # Increment count for each index
+                    conflict_counts.loc[conflict_idx] += 1
                 except Exception as e:
                     logger.error(f"Thread failed: {e}")
 
         to_remove = conflict_counts[conflict_counts > 1].index
-        removed_df = df.loc[to_remove]
+
+        removed_df = dataframe.loc[to_remove]
+
         if not removed_df.empty:
             logger.warning(f"{len(removed_df)} rows removed due to multiple unique constraint conflicts")
             logger.debug(f"Removed rows:\n{removed_df}")
-        return df.drop(index=to_remove)
+
+        return dataframe.drop(index=to_remove)
 
     def _do_upsert(self, chunk: pd.DataFrame, table: Table, pk_cols: List[str], valid_constraints: List[List[str]]):
         insert_stmt = insert(table).values(chunk.to_dict(orient="records"))
