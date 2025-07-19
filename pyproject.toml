@@ -34,13 +34,17 @@ classifiers = [
     "Typing :: Typed"
 ]
 dependencies = [
-    "pandas",
-    "SQLAlchemy",
-    "psycopg2-binary",
-    "pyodbc",
-    "python-dotenv",
-    "cleantext",
-    "tqdm",
+    "pandas>=2.0.0",
+    "SQLAlchemy>=2.0.0", 
+    "psycopg2-binary>=2.9.0",
+    "python-dotenv>=1.0.0",
+    "tqdm>=4.65.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "testcontainers[postgresql]>=4.0.0",
 ]
 
 [build-system]
@@ -50,13 +54,6 @@ build-backend = "poetry.core.masonry.api"
 [tool.poetry]
 name = "sqlalchemy-psql-upsert"
 packages = [{ include = "sqlalchemy_psql_upsert", from = "src" }]
-
-[tool.poetry.group.dev.dependencies]
-pytest = "*"
-pandas = "*"
-SQLAlchemy = "*"
-testcontainers = "*"
-tqdm = "*"
 
 [project.urls]
 Homepage = "https://github.com/machado000/sqlalchemy-psql-upsert"

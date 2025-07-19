@@ -8,14 +8,9 @@ This module provides PostgreSQL upsert functionality with support for:
 - Comprehensive constraint handling (PK, UNIQUE)
 """
 
-# import csv
-# import json
-# import os
-# import re
 import logging
 import pandas as pd
 import time
-
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from sqlalchemy import create_engine, inspect, text, bindparam
 from sqlalchemy import Engine, MetaData, Table
