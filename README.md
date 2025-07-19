@@ -1,51 +1,173 @@
-# sqlalchemy-upsert
+# SQLAlchemy PostgreSQL Upsert
 
-sqlalchemy-upsert is a Python package designed for efficiently upserting data from CSV files into PostgreSQL databases and dumping tables from Microsoft SQL Server (MSSQL) into CSV format. This package simplifies the process of data migration and synchronization between different database systems.
+A Python library for intelligent PostgreSQL upsert operations with advanced conflict resolution and multi-threaded processing.
 
-## Features
+## 🚀 Features
 
-- Upsert data from CSV files into PostgreSQL.
-- Dump tables from MSSQL to CSV files.
-- Support for handling various data types and ensuring data integrity during upserts.
-- Multi-threaded processing for improved performance.
+- **Multi-constraint conflict detection**: Automatically handles primary key, unique constraints, and composite constraints
+- **Smart conflict filtering**: Removes rows that would conflict with multiple existing records
+- **Multi-threaded processing**: Parallel chunk processing for large datasets
+- **Configurable batch sizes**: Optimize memory usage and processing speed
+- **Schema validation**: Automatic table and column validation before operations
+- **Comprehensive error handling**: Detailed logging and error reporting
 
-## Installation
+## 📦 Installation
 
-To install the package, you can use Poetry. First, ensure you have Poetry installed. Then, run the following command:
-
+### Using Poetry (Recommended)
 ```bash
-poetry install
+poetry install sqlalchemy_psql_upsert
 ```
 
-This will install all the necessary dependencies specified in the `pyproject.toml` file.
-
-## Usage
-
-To use the package, you can run the main script located in `src/sqlalchemy_upsert/main.py`. Ensure that your environment variables for database connections are set correctly.
-
+### Using pip
 ```bash
-python src/sqlalchemy_upsert/main.py
+pip install -e sqlalchemy_psql_upsert
 ```
+
+## 🛠️ Quick Start
+
+### Basic Usage
+
+```python
+import pandas as pd
+from sqlalchemy_psql_upsert import PostgresqlUpsert
+from sqlalchemy_psql_upsert.config import PgConfig
+
+# Configure database connection
+config = PgConfig()  # Loads from environment variables
+upserter = PostgresqlUpsert(config=config)
+
+# Prepare your data
+df = pd.DataFrame({
+    'id': [1, 2, 3],
+    'name': ['Alice', 'Bob', 'Charlie'],
+    'email': ['alice@example.com', 'bob@example.com', 'charlie@example.com']
+})
+
+# Perform upsert
+success = upserter.upsert_dataframe(
+    dataframe=df,
+    table_name='users',
+    schema='public',
+    chunk_size=10000,
+    max_workers=4
+)
+```
+
+### Advanced Configuration
+
+```python
+from sqlalchemy import create_engine
+
+# Using custom SQLAlchemy engine
+engine = create_engine('postgresql://user:pass@localhost:5432/mydb')
+upserter = PostgresqlUpsert(engine=engine, debug=True)
+
+# Custom upsert with options
+upserter.upsert_dataframe(
+    dataframe=large_df,
+    table_name='products',
+    schema='inventory',
+    chunk_size=5000,           # Smaller chunks for memory efficiency
+    max_workers=8,             # More workers for better parallelism
+    remove_multi_conflict_rows=True  # Remove problematic rows
+)
+```
+
+## ⚙️ Configuration
 
 ### Environment Variables
 
-The following environment variables need to be set for the database connections:
+Create a `.env` file or set the following environment variables:
 
-- `PGSQL_HOST`: Hostname for the PostgreSQL database.
-- `PGSQL_PORT`: Port for the PostgreSQL database (default is 5432).
-- `PGSQL_USER`: Username for the PostgreSQL database.
-- `PGSQL_PASS`: Password for the PostgreSQL database.
-- `PGSQL_NAME`: Name of the PostgreSQL database.
-- `MSSQL_HOST`: Hostname for the MSSQL database.
-- `MSSQL_PORT`: Port for the MSSQL database (default is 1433).
-- `MSSQL_USER`: Username for the MSSQL database.
-- `MSSQL_PASS`: Password for the MSSQL database.
-- `MSSQL_DATABASE`: Name of the MSSQL database.
+```bash
+# PostgreSQL Configuration
+PGSQL_HOST=localhost
+PGSQL_PORT=5432
+PGSQL_USER=your_username
+PGSQL_PASS=your_password
+PGSQL_NAME=your_database
+```
 
-## Contributing
+### Configuration Class
 
-Contributions are welcome! Please feel free to submit a pull request or open an issue for any enhancements or bug fixes.
+```python
+from sqlalchemy_psql_upsert.config import PgConfig
 
-## License
+# Default configuration from environment
+config = PgConfig()
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+# Manual configuration
+config = PgConfig(
+    host="localhost",
+    port="5432",
+    user="myuser",
+    password="mypass",
+    dbname="mydb"
+)
+
+print(config.uri())  # postgresql+psycopg2://myuser:mypass@localhost:5432/mydb
+```
+
+## 🔍 How It Works
+
+### Constraint Detection
+The library automatically analyzes your target table to identify:
+- Primary key constraints
+- Unique constraints  
+- Composite unique constraints
+
+### Conflict Resolution Process
+1. **Constraint Analysis**: Identifies all relevant constraints on the target table
+2. **Conflict Detection**: For each constraint, finds DataFrame rows that would conflict with existing data
+3. **Multi-Conflict Filtering**: Removes rows that would match multiple existing records (ambiguous conflicts)
+4. **Intelligent Upsert**: Uses PostgreSQL's `ON CONFLICT` clause with appropriate constraint targeting
+
+### Example Conflict Scenarios
+
+Consider a table with these constraints:
+- Primary key: `id`
+- Unique constraint: `email`
+- Composite unique constraint: `(doc_type, doc_number)`
+
+```python
+# This row conflicts on 'id' only - will be upserted
+{'id': 1, 'email': 'new@example.com', 'doc_type': 'CPF', 'doc_number': '123'}
+
+# This row conflicts on both 'id' and 'email' - will be removed
+{'id': 1, 'email': 'existing@example.com', 'doc_type': 'RG', 'doc_number': '456'}
+```
+
+## 🚨 Limitations & Considerations
+
+### Current Limitations
+- **PostgreSQL only**: Currently supports PostgreSQL databases exclusively
+- **Memory usage**: Large datasets are processed in memory (chunked processing helps)
+- **Complex constraints**: Some exotic PostgreSQL constraint types may not be fully supported
+- **Transaction scope**: Each chunk is processed in its own transaction
+
+### Best Practices
+- **Chunk sizing**: Start with 10,000 rows per chunk, adjust based on your data and hardware
+- **Worker count**: Use 2-4 workers per CPU core, but test with your specific workload
+- **Memory monitoring**: Monitor memory usage with large datasets
+- **Index considerations**: Ensure proper indexing on conflict columns for optimal performance
+
+## 🤝 Contributing
+
+We welcome contributions! Here's how to get started:
+
+1. **Fork the repository**
+2. **Create a feature branch**: `git checkout -b feature/amazing-feature`
+3. **Make your changes** and add tests
+4. **Run the test suite**: `pytest tests/ -v`
+5. **Submit a pull request**
+
+
+## 📝 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## 🙋 Support
+
+- **Issues**: [GitHub Issues](https://github.com/yourusername/sqlalchemy-upsert/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/yourusername/sqlalchemy-upsert/discussions)
+- **Documentation**: Check the docstrings and test files for detailed usage examples
