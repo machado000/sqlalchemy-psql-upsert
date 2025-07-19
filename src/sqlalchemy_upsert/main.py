@@ -1,23 +1,28 @@
 """
 main.py - Main script for upserting data to PostgreSQL tables.
+
+This module provides PostgreSQL upsert functionality with support for:
+- Automatic conflict detection and resolution
+- Multi-threaded chunk processing
+- Progress tracking with tqdm
+- Comprehensive constraint handling (PK, UNIQUE)
 """
 
-import csv
-import json
+# import csv
+# import json
+# import os
+# import re
 import logging
-import os
 import pandas as pd
-import re
 import time
 
-# from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from sqlalchemy import create_engine, inspect, text, bindparam
 from sqlalchemy import Engine, MetaData, Table
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import OperationalError
 from tqdm import tqdm
-from typing import List, Tuple, Union
+from typing import Dict, List, Set, Tuple, Optional, Union
 from .config import PgConfig
 
 logger = logging.getLogger(__name__)
@@ -25,150 +30,283 @@ logger.propagate = True
 
 
 class PostgresqlUpsert:
+    """
+    PostgreSQL upsert utility class with support for conflict resolution and multi-threading.
 
-    def __init__(self, config: PgConfig = None, engine: Engine = None, debug: bool = False):
+    This class provides methods to upsert pandas DataFrames into PostgreSQL tables with
+    automatic handling of primary key and unique constraint conflicts.
+    """
+
+    def __init__(self, config: Optional['PgConfig'] = None, engine: Optional[Engine] = None,
+                 debug: bool = False) -> None:
+        """
+        Initialize PostgreSQL upsert client.
+
+        Args:
+            config: PostgreSQL configuration object. If None, default config will be used.
+            engine: SQLAlchemy engine instance. If provided, config will be ignored.
+            debug: Enable debug logging for detailed operation information.
+
+        Raises:
+            ValueError: If neither config nor engine is provided and default config fails.
+        """
         if engine:
             self.engine = engine
+            logger.info("PostgreSQL upsert client initialized with provided engine")
         else:
             self.config = config or PgConfig()
             self.engine = create_engine(self.config.uri())
+            logger.info(f"PostgreSQL upsert client initialized with config: {self.config.host}:{self.config.port}")
 
         if debug:
             logger.setLevel(logging.DEBUG)
+            logger.info("Debug logging enabled for PostgreSQL upsert operations")
 
     def create_engine(self) -> Engine:
+        """Create a new SQLAlchemy engine using default configuration."""
         uri = PgConfig().uri()
+        logger.debug(f"Creating new database engine with URI: {uri}")
         return create_engine(uri)
 
-    def list_tables(self):
+    def list_tables(self) -> List[str]:
+        """
+        Get a list of all table names in the database.
+
+        Returns:
+            List of table names in the database.
+        """
         inspector = inspect(self.engine)
-        return inspector.get_table_names()
+        tables = inspector.get_table_names()
+        logger.debug(f"Found {len(tables)} tables in database: {tables}")
+        return tables
 
-    def _get_constraints(self, dataframe: pd.DataFrame,
-                         table_name: str, schema: str = "public") -> Tuple[List[str], List[List[str]]]:
+    def _get_constraints(self, dataframe: pd.DataFrame, table_name: str,
+                         schema: str = "public") -> Tuple[List[str], List[List[str]]]:
+        """
+        Get primary key and unique constraints for a table.
 
+        Args:
+            dataframe: DataFrame to check column compatibility against
+            table_name: Name of the target table
+            schema: Database schema name
+
+        Returns:
+            Tuple of (primary_key_columns, list_of_unique_constraint_columns)
+        """
         if dataframe.empty:
-            logger.warning("Received empty DataFrame, skipping _get_constraints.")
+            logger.warning("Received empty DataFrame for constraint analysis, returning empty constraints")
             return [], []
 
-        inspector = inspect(self.engine)
-        pk_cols = inspector.get_pk_constraint(table_name, schema).get("constrained_columns", [])
-        uniques = inspector.get_unique_constraints(table_name, schema)
+        try:
+            inspector = inspect(self.engine)
+            pk_constraint = inspector.get_pk_constraint(table_name, schema)
+            pk_cols = pk_constraint.get('constrained_columns', [])
+            uniques = inspector.get_unique_constraints(table_name, schema)
 
-        unique_sets = [
-            u["column_names"]
-            for u in uniques
-            if all(col in dataframe.columns for col in u["column_names"])
-        ]
+            logger.debug(f"Retrieved constraints for {schema}.{table_name}: "
+                         f"PK={pk_cols}, unique_constraints={len(uniques)}")
 
-        if pk_cols and all(c in dataframe.columns for c in pk_cols):
-            return pk_cols, [pk_cols] + unique_sets
+            # Filter unique constraints to only include those with columns present in DataFrame
+            unique_sets = []
+            for u in uniques:
+                constraint_cols = u['column_names']
+                if all(col in dataframe.columns for col in constraint_cols):
+                    unique_sets.append(constraint_cols)
+                else:
+                    logger.debug(f"Skipping unique constraint {constraint_cols} - "
+                                 f"columns not present in DataFrame")
 
-        return pk_cols, unique_sets
+            # If PK columns exist and are in DataFrame, include them
+            if pk_cols and all(c in dataframe.columns for c in pk_cols):
+                logger.debug(f"Primary key constraint {pk_cols} will be used for upsert")
+                return pk_cols, [pk_cols] + unique_sets
+            else:
+                if pk_cols:
+                    logger.warning(f"Primary key columns {pk_cols} not found in DataFrame columns, "
+                                   f"will rely on unique constraints only")
+
+            logger.info(f"Found {len(unique_sets)} usable unique constraints for upsert operations")
+            return pk_cols, unique_sets
+
+        except Exception as e:
+            logger.error(f"Failed to retrieve constraints for table {schema}.{table_name}: {str(e)}")
+            raise
 
     def _check_conflicts(self, dataframe: pd.DataFrame, constraint: Union[str, List[str]],
-                         table_name: str, schema: str = "public") -> pd.Index:
+                         table_name: str, schema: str = "public") -> Dict[int, Set[Tuple]]:
         """
-        Return the index (pandas Index) of rows in the DataFrame that would conflict with existing rows in the table.
-        Uses SQLAlchemy parameter expansion for IN clauses.
+        For each row in the DataFrame, return a mapping from DataFrame index to set of matched
+        table row identifiers (PK tuple or ctid) in the table.
+
+        Args:
+            dataframe: Input DataFrame to check for conflicts
+            constraint: Column name(s) that form the constraint
+            table_name: Target database table name
+            schema: Database schema name
+
+        Returns:
+            Dictionary mapping DataFrame index to set of table row identifiers
         """
 
         cols = [constraint] if isinstance(constraint, str) else (constraint or [])
         if not cols:
             logger.warning("No constraint columns provided, skipping _check_conflicts.")
-            return pd.Index([])
+            return {}
 
         inspector = inspect(self.engine)
         table_columns = {col['name'] for col in inspector.get_columns(table_name, schema=schema)}
+        pk_cols = inspector.get_pk_constraint(table_name, schema).get('constrained_columns', [])
 
         df_columns = set(dataframe.columns)
         if not all(col in df_columns and col in table_columns for col in cols):
-            logger.warning(
-                f"Constraint {cols} columns not present in both DataFrame and table {schema}.{table_name}, skipping _check_conflicts.")
-            return pd.Index([])
+            logger.warning(f"Constraint {cols} columns not present in both DataFrame and "
+                           f"table {schema}.{table_name}, skipping _check_conflicts.")
+            return {}
 
         df_subset = dataframe[cols]
         if df_subset.empty:
             logger.warning("Empty subset dataframe to check for conflicts, skipping _check_conflicts.")
-            return pd.Index([])
+            return {}
 
         # Sanitize identifiers (basic)
         safe_cols = [f'"{col}"' for col in cols]
         safe_table = f'"{schema}"."{table_name}"'
 
-        if len(cols) == 1:
-            # Single-column constraint
-            vals = df_subset[cols[0]].tolist()
-            sql = text(f"""
-                SELECT DISTINCT {safe_cols[0]}
-                FROM {safe_table}
-                WHERE {safe_cols[0]} IN :vals
-            """).bindparams(bindparam('vals', expanding=True))
+        # Determine identifier columns: PK or ctid
+        if pk_cols:
+            id_cols = [f'"{col}"' for col in pk_cols]
         else:
-            # Multi-column constraint
+            id_cols = ['ctid']
+
+        select_cols = id_cols + safe_cols
+        select_cols_str = ', '.join(select_cols)
+
+        # Write WHERE clause for single or multiple constraint columns
+        if len(cols) == 1:
+            vals = df_subset[cols[0]].tolist()
+            where_clause = f"{safe_cols[0]} IN :vals"
+        else:
             vals = [tuple(row) for row in df_subset[cols].to_numpy()]
             col_tuple = f"({', '.join(safe_cols)})"
-            sql = text(f"""
-                SELECT DISTINCT {', '.join(safe_cols)}
-                FROM {safe_table}
-                WHERE {col_tuple} IN :vals
-            """).bindparams(bindparam('vals', expanding=True))
+            where_clause = f"{col_tuple} IN :vals"
+
+        query = text(f"""
+            SELECT {select_cols_str}
+            FROM {safe_table}
+            WHERE {where_clause}
+        """).bindparams(bindparam('vals', expanding=True))
 
         with self.engine.connect() as conn:
-            result = conn.execute(sql, {'vals': vals})
-            existing = set(tuple(row) if len(cols) > 1 else (row[0],) for row in result.fetchall())
+            result = conn.execute(query, {'vals': vals})
 
-        conflict_indices = df_subset[df_subset[cols].apply(tuple, axis=1).isin(existing)].index
+            # Build mapping: constraint tuple -> set of PK/ctid tuples
+            table_row_map = {}
+            for row in result.fetchall():
+                id_val = tuple(row[:len(id_cols)])
+                constraint_val = tuple(row[len(id_cols):])
+                table_row_map.setdefault(constraint_val, set()).add(id_val)
 
-        return conflict_indices
+        # Build mapping: DataFrame index -> set of matched table row identifiers (PK/ctid)
+        index_to_table_rows = {}
+        for idx, row in df_subset.iterrows():
+            key = tuple(row) if len(cols) > 1 else (row.iloc[0],)
+            if key in table_row_map:
+                index_to_table_rows[idx] = table_row_map[key]
 
-    def _remove_multi_conflict_rows(self, dataframe: pd.DataFrame, table_name: str, schema: str = "public",
+        logger.debug(f"Found {len(index_to_table_rows)} DataFrame rows with conflicts in table")
+        return index_to_table_rows
+
+    def _remove_multi_conflict_rows(self, dataframe: pd.DataFrame, table_name: str,
+                                    schema: str = "public",
                                     max_workers: int = 4) -> pd.DataFrame:
+        """
+        Remove DataFrame rows that match more than one unique table row (across all unique constraints),
+        using the dict[int, set[tuple]] output from _check_conflicts.
 
+        Args:
+            dataframe: Input DataFrame to filter
+            table_name: Target database table name
+            schema: Database schema name
+            max_workers: Maximum number of threads for parallel constraint checking
+
+        Returns:
+            Filtered DataFrame with multi-conflict rows removed
+        """
         if dataframe.empty:
-            logger.warning("Received empty Dataframe, skipping multi-conflict removal.")
+            logger.warning("Received empty DataFrame, skipping multi-conflict removal.")
             return dataframe
 
         _, uniques = self._get_constraints(dataframe, table_name, schema)
         if not uniques:
-            logger.warning(f"No unique constraints found for table {table_name}, skipping multi-conflict removal.")
+            logger.warning(f"No unique constraints found for table {table_name}, "
+                           f"skipping multi-conflict removal.")
             return dataframe
 
-        conflict_counts = pd.Series(0, index=dataframe.index)
+        # For each DataFrame index, collect all matched PK/ctid tuples across all constraints
+        index_to_table_rows: Dict[int, Set[Tuple]] = {}
 
-        def worker(constraint):
+        def worker(constraint: List[str]) -> Dict[int, Set[Tuple]]:
             try:
-                return self._check_conflicts(dataframe,  constraint, table_name, schema)
+                return self._check_conflicts(dataframe, constraint, table_name, schema)
             except Exception as e:
                 logger.warning(f"Constraint {constraint} check failed: {e}")
-                return pd.Index([])
+                return {}
+
+        logger.info(f"Checking {len(uniques)} unique constraints for multi-conflicts "
+                    f"using {max_workers} workers")
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(worker, c): c for c in uniques}
             for future in as_completed(futures):
+                constraint = futures[future]
                 try:
-                    conflict_idx = future.result()
-                    # Increment count for each index
-                    conflict_counts.loc[conflict_idx] += 1
+                    result = future.result()
+                    for idx, pk_set in result.items():
+                        if idx not in index_to_table_rows:
+                            index_to_table_rows[idx] = set()
+                        index_to_table_rows[idx].update(pk_set)
                 except Exception as e:
-                    logger.error(f"Thread failed: {e}")
+                    logger.error(f"Thread processing constraint {constraint} failed: {e}")
 
-        to_remove = conflict_counts[conflict_counts > 1].index
+        # Remove rows that match more than one unique table row (i.e., set size > 1)
+        to_remove = [idx for idx, pk_set in index_to_table_rows.items() if len(pk_set) > 1]
 
         removed_df = dataframe.loc[to_remove]
 
         if not removed_df.empty:
             logger.warning(f"{len(removed_df)} rows removed due to multiple unique constraint conflicts")
             logger.debug(f"Removed rows:\n{removed_df}")
+        else:
+            logger.info("No multi-conflict rows found, all data will be processed")
 
         return dataframe.drop(index=to_remove)
 
-    def _do_upsert(self, chunk: pd.DataFrame, table: Table, pk_cols: List[str], valid_constraints: List[List[str]]):
-        insert_stmt = insert(table).values(chunk.to_dict(orient="records"))
+    def _do_upsert(self, chunk: pd.DataFrame, table: Table, pk_cols: List[str],
+                   uniques: List[List[str]]) -> None:
+        """
+        Execute upsert for a single chunk of data.
+
+        Args:
+            chunk: DataFrame chunk to upsert
+            table: SQLAlchemy Table object
+            pk_cols: Primary key column names
+            uniques: List of unique constraint column lists
+
+        Raises:
+            OperationalError: For transient database errors (retries automatically)
+            Exception: For permanent errors
+        """
+        if chunk.empty:
+            logger.warning("Received empty chunk for upsert, skipping")
+            return
+
+        logger.debug(f"Processing chunk with {len(chunk)} rows")
+
+        insert_stmt = insert(table).values(chunk.to_dict(orient='records'))
         update_cols = {c.name: insert_stmt.excluded[c.name] for c in table.columns if c.name not in pk_cols}
 
         stmt = None
-        for constraint in valid_constraints:
+        for constraint in uniques:
             if all(col in chunk.columns for col in constraint):
                 stmt = insert_stmt.on_conflict_do_update(
                     index_elements=constraint,
@@ -177,7 +315,7 @@ class PostgresqlUpsert:
                 break
 
         if stmt is None:
-            logger.warning("[FALLBACK] Inserted chunk with no matching constraint.")
+            logger.warning("No matching constraints found, performing plain INSERT (may fail on conflicts)")
             stmt = insert_stmt
 
         retries = 0
@@ -186,269 +324,111 @@ class PostgresqlUpsert:
         while retries <= max_retries:
             try:
                 with self.engine.begin() as conn:
-                    conn.execute(stmt)
+                    result = conn.execute(stmt)
+                    rows_affected = result.rowcount if hasattr(result, 'rowcount') else len(chunk)
+                    logger.debug(f"Chunk processed successfully, {rows_affected} rows affected")
                 return
             except OperationalError as e:
                 retries += 1
-                logger.warning(f"Transient DB error on chunk, retry {retries}/{max_retries}: {e}")
-                time.sleep(backoff_factor ** retries)
+                wait_time = backoff_factor ** retries
+                logger.warning(f"Transient database error (attempt {retries}/{max_retries}): {e}. "
+                               f"Retrying in {wait_time}s...")
+                time.sleep(wait_time)
             except Exception as e:
-                logger.error(f"Permanent error on chunk: {e}")
+                logger.error(f"Permanent error processing chunk: {e}")
                 return
 
-        logger.error("Max retries reached, giving up on chunk")
+        logger.error(f"Max retries ({max_retries}) reached for chunk, operation failed")
 
     def upsert_dataframe(self, dataframe: pd.DataFrame, table_name: str, schema: str = "public",
-                         chunk_size: int = 10_000, max_workers: int = 4, deduplicate: bool = True):
+                         chunk_size: int = 10_000, max_workers: int = 4,
+                         remove_multi_conflict_rows: bool = True) -> bool:
+        """
+        Upsert a pandas DataFrame into a PostgreSQL table with conflict resolution.
+
+        Args:
+            dataframe: Input DataFrame to upsert
+            table_name: Target table name in the database
+            schema: Database schema name (default: "public")
+            chunk_size: Number of rows per chunk for parallel processing
+            max_workers: Maximum number of worker threads
+            remove_multi_conflict_rows: Whether to remove rows with multiple conflicts
+
+        Returns:
+            True if successful, raises exceptions on failure
+
+        Raises:
+            ValueError: If table doesn't exist or other validation errors
+            Exception: For database errors during operation
+        """
         if dataframe.empty:
             logger.warning("Received empty DataFrame. Skipping upsert.")
             return True
 
+        logger.info(f"Starting upsert operation for {len(dataframe)} rows into {schema}.{table_name}")
         df = dataframe.copy()
 
-        metadata = MetaData(schema=schema)
-        try:
-            table = Table(table_name, metadata, autoload_with=self.engine)
-        except Exception as e:
-            logger.error(f"Destination table '{schema}.{table_name}' not found: {e}")
-            return False
+        inspector = inspect(self.engine)
 
-        pk_cols, valid_constraints = self._get_constraints(df, table, schema)
+        if table_name not in inspector.get_table_names(schema=schema):
+            error_msg = f"Destination table '{schema}.{table_name}' not found."
+            logger.error(error_msg)
+            raise ValueError(error_msg)
 
-        if not valid_constraints:
+        pk_cols, uniques = self._get_constraints(df, table_name, schema)
+
+        if not uniques:
             logger.warning(
                 f"No PK or UNIQUE constraints found on '{schema}.{table_name}'. Performing plain INSERT.")
         else:
-            df = self._conflict_aware_deduplicate(df, valid_constraints)
+            logger.info(f"Running multi-conflict removal with constraints: {uniques}")
+            df = self._remove_multi_conflict_rows(df, table_name, schema, max_workers=max_workers)
 
-        if deduplicate and valid_constraints:
-            logger.debug(f"Running conflict-aware deduplication with constraints: {valid_constraints}")
-            df = self._conflict_aware_deduplicate(df, valid_constraints)
+        if df.empty:
+            logger.warning("No rows remaining after conflict resolution. Operation completed.")
+            return True
+
+        logger.info(f"Upserting {len(df)} rows into {schema}.{table_name} in chunks of {chunk_size}...")
+
+        # Progress bars: one for total rows, one for chunks
+        num_chunks = (len(df) + chunk_size - 1) // chunk_size
+        chunk_indices = [(i, min(i + chunk_size, len(df))) for i in range(0, len(df), chunk_size)]
+
+        try:
+            metadata = MetaData(schema=schema)
+            table = Table(table_name, metadata, autoload_with=self.engine)
+        except Exception as e:
+            error_msg = f"Failed to load table '{schema}.{table_name}': {e}"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+
+        successful_chunks = 0
+        failed_chunks = 0
+
+        with tqdm(total=len(df), desc="Total rows upserted", unit="rows") as row_pbar:
+            with tqdm(total=num_chunks, desc="Upserting chunks", unit="chunk") as chunk_pbar:
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = {}
+                    for start, end in chunk_indices:
+                        chunk = df.iloc[start:end]
+                        future = executor.submit(self._do_upsert, chunk, table, pk_cols, uniques)
+                        futures[future] = (start, end)
+
+                    for future in as_completed(futures):
+                        start, end = futures[future]
+                        chunk_size_actual = end - start
+                        if exc := future.exception():
+                            logger.error(f"Chunk {start}:{end} failed: {exc}")
+                            failed_chunks += 1
+                        else:
+                            logger.debug(f"Chunk {start}:{end} upserted successfully.")
+                            successful_chunks += 1
+                        row_pbar.update(chunk_size_actual)
+                        chunk_pbar.update(1)
+
+        if failed_chunks > 0:
+            logger.warning(f"Upsert completed with {failed_chunks} failed chunks out of {num_chunks} total chunks")
         else:
-            logger.warning("Deduplication skipped; relying on PostgreSQL ON CONFLICT for conflict resolution.")
+            logger.info(f"Upsert completed successfully. {successful_chunks} chunks processed.")
 
-        logger.info(f"Upserting {len(df)} rows into {schema}.{table_name}...")
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = []
-            for i in range(0, len(df), chunk_size):
-                chunk = df.iloc[i:i + chunk_size]
-                futures.append(executor.submit(
-                    self._do_upsert, chunk, table, pk_cols, valid_constraints
-                ))
-
-            with tqdm(total=len(futures), desc="Upserting chunks") as pbar:
-                for future in as_completed(futures):
-                    if exc := future.exception():
-                        logger.error(f"Chunk failed: {exc}")
-                    pbar.update(1)
-
-        logger.info("Upsert complete.")
         return True
-
-    def dump_table_to_csv(self, table_name: str, schema: str = "public",
-                          output_dir: str = "data", chunksize: int = 100_000):
-        os.makedirs(output_dir, exist_ok=True)
-        csv_path = os.path.join(output_dir, f"{table_name}.csv")
-
-        chunk_iter = pd.read_sql_table(table_name, schema, self.engine, chunksize=chunksize)
-
-        first_chunk = True
-        for chunk in tqdm(chunk_iter, desc=f"Dumping {table_name}"):
-            mode = 'w' if first_chunk else 'a'
-            header = first_chunk
-
-            chunk = chunk.applymap(
-                lambda x: x.replace('\n', ' ').replace('\r', ' ') if isinstance(x, str) else x
-            )
-            chunk.to_csv(csv_path, mode=mode, index=False, header=header, encoding='utf-8',
-                         quoting=csv.QUOTE_ALL, quotechar='"', escapechar='\\', lineterminator='\n'
-                         )
-
-    def export_pgsql_dtypes(self, table_name, schema="public", output_dir="./"):
-        dtypes_path = os.path.join(output_dir, f"{table_name}.dtypes.json")
-
-        insp = inspect(self.engine)
-        columns = insp.get_columns(table_name, schema=schema)
-
-        def map_pgsql_to_pd(dtype_str):
-            dtype_str = dtype_str.upper()
-
-            if re.search(r'\b(INT|INT2|INT4|INT8|SMALLINT|BIGINT)\b', dtype_str):
-                return "int64"
-            elif re.search(r'\b(FLOAT|FLOAT4|FLOAT8|REAL|DOUBLE PRECISION|NUMERIC|DECIMAL)\b', dtype_str):
-                return "float64"
-            elif re.search(r'\b(BOOL|BOOLEAN)\b', dtype_str):
-                return "bool"
-            elif re.search(r'\b(DATE|TIMESTAMP|TIME|TIMESTAMPTZ)\b', dtype_str):
-                return "datetime64[ns]"
-            else:
-                return "string"
-
-        dtypes = {
-            col["name"]: map_pgsql_to_pd(str(col["type"]))
-            for col in columns
-        }
-
-        with open(dtypes_path, "w") as f:
-            json.dump(dtypes, f, indent=2)
-
-# from cleantext import clean
-# from urllib.parse import quote_plus
-
-# class MSSQLConnector:
-#     def __init__(self) -> None:
-#         db_host: str = os.getenv("MSSQL_HOST")
-#         db_port: str = os.getenv("MSSQL_PORT", "1433")
-#         db_user: str = os.getenv("MSSQL_USER")
-#         db_pass: str = os.getenv("MSSQL_PASS")
-#         db_name: str = os.getenv("MSSQL_DATABASE")
-#         connection_string = (
-#             f"DRIVER={{ODBC Driver 17 for SQL Server}};"
-#             f"SERVER={db_host},{db_port};"
-#             f"DATABASE={db_name};"
-#             f"UID={db_user};"
-#             f"PWD={db_pass};"
-#         )
-#         params = quote_plus(connection_string)
-#         uri = f"mssql+pyodbc:///?odbc_connect={params}"
-#         self.engine = self.create_engine(uri)
-
-#     def create_engine(self, uri) -> Engine:
-#         try:
-#             engine = create_engine(uri)
-#             return engine
-#         except Exception as e:
-#             logger.error(f"Failed to create engine: {e}")
-
-#     def list_tables(self):
-#         inspector = inspect(self.engine)
-#         return inspector.get_table_names()
-
-#     def get_table_schema(self, table_name: str) -> dict:
-#         logger.info(f"Querying schema for table '{table_name}'")
-
-#         try:
-#             with self.engine.connect() as conn:
-#                 query = f"SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '{table_name}'"
-#                 result = conn.execute(query)
-#                 schema = {row[0]: row[1] for row in result}
-#                 return schema
-
-#         except Exception as err:
-#             logger.error(f"Error querying MSSQL table: {err}")
-#             return None
-
-#     def dump_table_to_csv(self, table_name: str, output_dir: str = "data", chunksize: int = 100_000):
-#         os.makedirs(output_dir, exist_ok=True)
-#         csv_path = os.path.join(output_dir, f"{table_name}.csv")
-#         dtypes_path = os.path.join(output_dir, f"{table_name}.dtypes.json")
-
-#         chunk_iter = pd.read_sql_table(table_name, self.engine, chunksize=chunksize)
-
-#         first_chunk = True
-#         for chunk in tqdm(chunk_iter, desc=f"Dumping {table_name}"):
-#             mode = 'w' if first_chunk else 'a'
-#             header = first_chunk
-
-#             chunk = chunk.applymap(
-#                 lambda x: x.replace('\n', ' ').replace('\r', ' ') if isinstance(x, str) else x
-#             )
-#             chunk.to_csv(csv_path, mode=mode, index=False, header=header, encoding='utf-8',
-#                          quoting=csv.QUOTE_ALL, quotechar='"', escapechar='\\', lineterminator='\n'
-#                          )
-
-#             if first_chunk:
-#                 json.dump({col: str(dt) for col, dt in chunk.dtypes.items()}, open(dtypes_path, 'w'))
-#                 first_chunk = False
-
-#     def append_df_bulk(self, table_name: str, dataframe: pd.DataFrame, batch_size: int = 1_000) -> bool:
-#         logger.info(f"Appending dataframe to table '{table_name}' in bulk")
-
-#         df = dataframe.copy()
-#         df.columns = map(str, df.columns)
-
-#         for column in df.select_dtypes(include=['object']):
-#             df[column] = df[column].apply(lambda x: clean(x, fix_unicode=True, lower=False) if x is not None else None)
-
-#         try:
-#             total_batches = (len(df) + batch_size - 1) // batch_size
-
-#             with tqdm(total=total_batches, desc=f"Appending to {table_name}") as pbar:
-#                 for i in range(total_batches):
-#                     start_idx = i * batch_size
-#                     end_idx = min((i + 1) * batch_size, len(df))
-#                     batch = df.iloc[start_idx:end_idx]
-
-#                     with self.engine.begin() as conn:
-#                         batch.to_sql(
-#                             name=table_name,
-#                             con=conn,
-#                             if_exists='append',
-#                             index=False,
-#                             method='multi'
-#                         )
-#                     pbar.update(1)
-
-#             logger.info(f"Successfully appended {len(df)} rows to table {table_name}")
-#             return True
-
-#         except Exception as e:
-#             logger.error(f"Failed to append dataframe to table: {e}")
-#             raise
-
-
-# def main():
-
-#     # UPSERTING DATA FROM CSV FILES TO PGSQL
-
-#     pgsql = PSQLConnector()
-#     last_crawl_csv_files = [f for f in os.listdir("./winescraper/files") if "last_crawl" in f and f.endswith(".csv")]
-#     store_dict = [
-#         {"store_name": "bancadoramon", "table_name": "B2C_CONC_BANCADORAMON"},
-#         {"store_name": "divinho", "table_name": "B2C_CONC_DIVINHO"},
-#         {"store_name": "encontrevinhos", "table_name": "B2C_CONC_ENCONTRE_VINHOS"},
-#         {"store_name": "evino", "table_name": "B2C_CONC_EVINO"},
-#         {"store_name": "grandcru", "table_name": "B2C_CONC_GRANDCRU"},
-#         {"store_name": "mistral", "table_name": "B2C_CONC_MISTRAL"},
-#         {"store_name": "paodeacucar", "table_name": "B2C_CONC_PAO_ACUCAR"},
-#         {"store_name": "stmarche", "table_name": "B2C_CONC_SAINT_MARCHE"},
-#         {"store_name": "vinci", "table_name": "B2C_CONC_VINCI"},
-#         {"store_name": "worldwine", "table_name": "B2C_CONC_WORLD_WINE"}
-#     ]
-
-#     for item in store_dict:
-#         store = item["store_name"]
-#         table = item["table_name"]
-
-#         csv_file = next((file for file in last_crawl_csv_files if store.lower()
-#                         in file.lower() and 'last_crawl' in file.lower()), None)
-
-#         if not csv_file:
-#             logger.error(f"No CSV file found for store: {store}")
-#             continue
-
-#         try:
-#             logger.info(f"Upserting: {csv_file}")
-#             csv_path = f"./winescraper/files/{csv_file}"
-
-#             pgsql.export_pgsql_dtypes(table_name=table, schema="Holos_FB", output_dir="./data")
-
-#             dtypes_path = f"./data/{table}.dtypes.json"
-#             dtypes = json.load(open(dtypes_path))
-
-#             date_cols = [col for col, dt in dtypes.items() if dt.startswith("datetime") and col != "insert_time"]
-
-#             df = pd.read_csv(csv_path, encoding='utf-8', dtype=dtypes,
-#                              parse_dates=date_cols, quotechar='"', engine='python')
-
-#             pgsql.upsert_dataframe(df, table_name=table, schema="Holos_FB")
-
-#             logger.info(f"Successfully upserted: {csv_file}")
-
-#         except Exception as e:
-#             logger.error(f"Error upserting: {csv_file}: {e}")
-
-
-# if __name__ == "__main__":
-#     main()
