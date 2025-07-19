@@ -1,5 +1,11 @@
 # SQLAlchemy PostgreSQL Upsert
 
+[![PyPI version](https://img.shields.io/pypi/v/sqlalchemy-psql-upsert)](https://pypi.org/project/sqlalchemy-psql-upsert/)
+[![License](https://img.shields.io/github/license/machado000/sqlalchemy-psql-upsert)](https://github.com/machado000/sqlalchemy-psql-upsert/blob/main/LICENSE)
+[![Issues](https://img.shields.io/github/issues/machado000/sqlalchemy-psql-upsert)](https://github.com/machado000/sqlalchemy-psql-upsert/issues)
+[![Last Commit](https://img.shields.io/github/last-commit/machado000/sqlalchemy-psql-upsert)](https://github.com/machado000/sqlalchemy-psql-upsert/commits/main)
+
+
 A Python library for intelligent PostgreSQL upsert operations with advanced conflict resolution and multi-threaded processing.
 
 ## 🚀 Features
