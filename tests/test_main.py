@@ -2,7 +2,7 @@ import pytest
 import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy import Table, Column, Integer, String, MetaData, UniqueConstraint
-from sqlalchemy_upsert.main import PostgresqlUpsert
+from sqlalchemy_psql_upsert.main import PostgresqlUpsert
 from testcontainers.postgres import PostgresContainer
 
 
