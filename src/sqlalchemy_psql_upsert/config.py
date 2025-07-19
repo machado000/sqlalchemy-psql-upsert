@@ -13,7 +13,7 @@ Environment Variables:
     PGSQL_NAME: Name of the target database
 
 Example:
-    >>> from sqlalchemy_upsert.config import PgConfig
+    >>> from sqlalchemy_psql_upsert.config import PgConfig
     >>> config = PgConfig()
     >>> engine = create_engine(config.uri())
 """
