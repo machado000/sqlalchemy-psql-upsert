@@ -1,5 +1,5 @@
 [project]
-name = "sqlalchemy_upsert"
+name = "sqlalchemy_psql_upsert"
 version = "0.1.0"
 description = "Upsert helper for PostgreSQL using SQLAlchemy."
 authors = [{name = "Joao Brito", email = "machado000@gmail.com"}]
@@ -21,7 +21,7 @@ requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
-packages = [{ include = "sqlalchemy_upsert", from = "src" }]
+packages = [{ include = "sqlalchemy_psql_upsert", from = "src" }]
 
 [tool.poetry.group.dev.dependencies]
 pytest = "*"
