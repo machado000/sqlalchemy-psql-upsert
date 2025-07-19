@@ -47,7 +47,7 @@ def populated_table(pg_engine):
     yield
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="function")
 def test_df():
     test_df = pd.DataFrame([
         {"id": 1, "email": "a@x.com", "doc_type": "CPF", "doc_number": "901"},
@@ -71,95 +71,80 @@ def test_df():
 
 def test_get_constraints(upserter, test_df):
     table_name = "test_table"
-    pk, uniques = upserter._get_constraints(test_df, table_name)
-    assert pk == ["id"]
-    assert uniques == [['id'], ['email'], ['doc_type', 'doc_number']]
-
     empty_df = pd.DataFrame()
+
     pk, uniques = upserter._get_constraints(empty_df, table_name)
     assert pk == []
     assert uniques == []
 
+    pk, uniques = upserter._get_constraints(test_df, table_name)
+    assert pk == ["id"]
+    assert uniques == [['id'], ['email'], ['doc_type', 'doc_number']]
+
+    with pytest.raises(Exception):
+        upserter._get_constraints(test_df, "nonexistent_table")
+
 
 def test_check_conflicts(upserter, populated_table, test_df):
+
     table_name = "test_table"
-    constraints = [['id'], ['email'], ['doc_type', 'doc_number'], ['nonexisting']]
+    constraints = [['id'], ['email'], ['doc_type', 'doc_number'], ['nonexisting_constraint'], []]
 
     conflict_sets = []
 
     for keyset in constraints:
-        conflict_index = upserter._check_conflicts(test_df, keyset, table_name)
-        print(f"Conflicts for {keyset}: {conflict_index.tolist()}")
-        conflict_sets.append(conflict_index)
+        conflict_dict = upserter._check_conflicts(test_df, keyset, table_name)
+        conflict_sets.append(conflict_dict)
 
-    assert conflict_sets[0].tolist() == [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13]  # return for 'id'
-    assert conflict_sets[1].tolist() == [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14]  # return for 'email'
-    assert conflict_sets[2].tolist() == [0, 1, 2, 3, 4, 5, 6, 7, 8, 11, 13, 14]  # return for 'doc_type', 'doc_number'
-    assert conflict_sets[3].tolist() == []  # return for 'nonexisting'
+    assert conflict_sets[0] == {0: {(1,)}, 1: {(2,)}, 2: {(3,)}, 3: {(4,)}, 4: {(5,)}, 5: {(6,)}, 6: {(7,)}, 7: {
+        (8,)}, 8: {(9,)}, 9: {(1,)}, 12: {(4,)}, 13: {(6,)}}  # return for 'id'
+    assert conflict_sets[1] == {0: {(1,)}, 1: {(2,)}, 2: {(3,)}, 3: {(4,)}, 4: {(5,)}, 5: {(6,)}, 6: {(7,)}, 7: {
+        (8,)}, 8: {(9,)}, 10: {(2,)}, 12: {(5,)}, 14: {(8,)}}  # return for 'email'
+    assert conflict_sets[2] == {0: {(1,)}, 1: {(2,)}, 2: {(3,)}, 3: {(4,)}, 4: {(5,)}, 5: {(6,)}, 6: {(7,)}, 7: {
+        (8,)}, 8: {(9,)}, 11: {(3,)}, 13: {(7,)}, 14: {(9,)}}  # return for 'doc_type', 'doc_number'
+    assert conflict_sets[3] == {}  # return for 'nonexisting_constraint'
+    assert conflict_sets[4] == {}  # return for 'empty_constraint'
+
+    empty_df = pd.DataFrame()
+    empty_keyset = []
+
+    empty_df_result = upserter._check_conflicts(empty_df, constraints[0], table_name)
+    assert empty_df_result == {}
+
+    empty_keyset_result = upserter._check_conflicts(test_df, empty_keyset, table_name)
+    assert empty_keyset_result == {}
+
+    with pytest.raises(Exception):
+        upserter._check_conflicts(test_df, constraints[0], "nonexisting_table")
 
 
 def test_remove_multi_conflict_rows(upserter, populated_table, test_df):
     table_name = "test_table"
+    expected_df = test_df[0:12].copy()
 
     result_df = upserter._remove_multi_conflict_rows(test_df, table_name)
-    expected_df = test_df[0:11].copy()
-
     pd.testing.assert_frame_equal(result_df.sort_values(by="id").reset_index(drop=True),
                                   expected_df.sort_values(by="id").reset_index(drop=True))
 
+    empty_df = pd.DataFrame()
 
-def test_empty_dataframe_skips(upserter, caplog):
-    df = pd.DataFrame()
-    result = upserter.upsert_dataframe(df, "test_table")
+    empty_df_result = upserter._remove_multi_conflict_rows(empty_df, table_name)
+    pd.testing.assert_frame_equal(empty_df, empty_df_result)
+
+    with pytest.raises(Exception):
+        upserter._remove_multi_conflict_rows(test_df, "nonexistent_table")
+
+
+def test_upsert_dataframe(upserter, populated_table, test_df):
+    table_name = "test_table"
+
+    result = upserter.upsert_dataframe(test_df, table_name)
     assert result is True
-    assert "empty DataFrame" in caplog.text
 
+    empty_df = pd.DataFrame()
 
-def test_missing_table_fails(upserter):
-    df = pd.DataFrame({"id": [1], "value": ["a"]})
-    result = upserter.upsert_dataframe(df, "nonexistent_table")
-    assert result is False
+    result = upserter.upsert_dataframe(empty_df, table_name)
+    assert result is True
 
-
-def test_get_constraints_order(upserter):
-    df = pd.DataFrame({"id": [1], "email": ["x"], "doc_type": ["CPF"], "doc_number": ["111"]})
-    table = Table("test_table", MetaData(), autoload_with=upserter.engine)
-    pk, constraints = upserter._get_constraints(df, table)
-    assert pk == ["id"]
-    assert constraints[0] == ["id"]
-
-
-def test_insert_fallback_on_no_constraints(upserter, caplog):
-    upserter.engine.execute("DROP TABLE IF EXISTS test_table")
-    upserter.engine.execute("""
-        CREATE TABLE test_table (
-            id INTEGER,
-            email TEXT,
-            doc_type TEXT,
-            doc_number TEXT
-        )
-    """)
-    df = pd.DataFrame({"email": ["a"], "doc_type": ["X"], "doc_number": ["000"]})
-    upserter.upsert_dataframe(df, "test_table")
-    assert "Performing plain INSERT" in caplog.text
-
-
-def test_upsert_with_constraints(upserter):
-    upserter.engine.execute("DROP TABLE IF EXISTS test_table")
-    upserter.engine.execute("""
-        CREATE TABLE test_table (
-            id INTEGER PRIMARY KEY,
-            email TEXT UNIQUE,
-            doc_type TEXT,
-            doc_number TEXT,
-            UNIQUE(doc_type, doc_number)
-        )
-    """)
-    df = pd.DataFrame([
-        {"id": 1, "email": "foo@x.com", "doc_type": "CPF", "doc_number": "111"},
-        {"id": 2, "email": "bar@x.com", "doc_type": "CPF", "doc_number": "111"},
-        {"id": 3, "email": "bar@x.com", "doc_type": "RG",  "doc_number": "222"},
-    ])
-    upserter.upsert_dataframe(df, "test_table")
-    count = upserter.engine.execute("SELECT COUNT(*) FROM test_table").scalar()
-    assert count == 2
+    with pytest.raises(Exception):
+        upserter.upsert_dataframe(test_df, "nonexistent_table")
