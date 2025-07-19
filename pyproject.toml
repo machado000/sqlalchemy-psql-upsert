@@ -1,11 +1,38 @@
 [project]
-name = "sqlalchemy_psql_upsert"
-version = "0.1.0"
-description = "Upsert helper for PostgreSQL using SQLAlchemy."
-authors = [{name = "Joao Brito", email = "machado000@gmail.com"}]
+name = "sqlalchemy-psql-upsert"
+version = "0.9.01"
+description = "PostgreSQL upsert library with intelligent conflict resolution and multi-threaded processing"
+authors = [{name = "Joao Brito"}]
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.9"
+keywords = [
+    "postgresql", 
+    "upsert", 
+    "sqlalchemy", 
+    "database", 
+    "conflict-resolution", 
+    "bulk-insert", 
+    "data-migration",
+    "pandas"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators", 
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Topic :: Database :: Database Engines/Servers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Systems Administration",
+    "Typing :: Typed"
+]
 dependencies = [
     "pandas",
     "SQLAlchemy",
@@ -21,6 +48,7 @@ requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
+name = "sqlalchemy-psql-upsert"
 packages = [{ include = "sqlalchemy_psql_upsert", from = "src" }]
 
 [tool.poetry.group.dev.dependencies]
@@ -29,3 +57,7 @@ pandas = "*"
 SQLAlchemy = "*"
 testcontainers = "*"
 tqdm = "*"
+
+[project.urls]
+Homepage = "https://github.com/machado000/sqlalchemy-psql-upsert"
+Issues = "https://github.com/machado000/sqlalchemy-psql-upsert/issues"
