@@ -26,17 +26,29 @@ poetry install sqlalchemy_psql_upsert
 
 ### Using pip
 ```bash
-pip install -e sqlalchemy_psql_upsert
+pip install sqlalchemy-psql-upsert
 ```
 
 ## 🛠️ Quick Start
+
+### Connection Testing
+
+```python
+from sqlalchemy_psql_upsert import test_connection
+
+# Test default connection
+success, message = test_connection()
+if success:
+    print("✅ Database connection OK")
+else:
+    print(f"❌ Connection failed: {message}")
+```
 
 ### Basic Usage
 
 ```python
 import pandas as pd
-from sqlalchemy_psql_upsert import PostgresqlUpsert
-from sqlalchemy_psql_upsert.config import PgConfig
+from sqlalchemy_psql_upsert import PostgresqlUpsert, PgConfig
 
 # Configure database connection
 config = PgConfig()  # Loads from environment variables
@@ -97,7 +109,7 @@ PGSQL_NAME=your_database
 ### Configuration Class
 
 ```python
-from sqlalchemy_psql_upsert.config import PgConfig
+from sqlalchemy_psql_upsert import PgConfig
 
 # Default configuration from environment
 config = PgConfig()
@@ -156,6 +168,65 @@ Consider a table with these constraints:
 - **Worker count**: Use 2-4 workers per CPU core, but test with your specific workload
 - **Memory monitoring**: Monitor memory usage with large datasets
 - **Index considerations**: Ensure proper indexing on conflict columns for optimal performance
+
+## � Testing
+
+Run the comprehensive test suite:
+
+```bash
+# Install with development dependencies
+pip install sqlalchemy-psql-upsert[dev]
+
+# Run tests
+pytest tests/ -v
+```
+
+The test suite uses TestContainers to spin up real PostgreSQL instances, ensuring tests run against actual database constraints.
+
+## 🔧 API Reference
+
+### Core Classes
+
+#### `PostgresqlUpsert`
+Main upsert client with intelligent conflict resolution.
+
+```python
+class PostgresqlUpsert:
+    def __init__(self, config=None, engine=None, debug=False):
+        """Initialize PostgreSQL upsert client."""
+    
+    def upsert_dataframe(self, dataframe, table_name, schema="public", 
+                        chunk_size=10000, max_workers=4, 
+                        remove_multi_conflict_rows=True) -> bool:
+        """Upsert DataFrame with conflict resolution."""
+    
+    def list_tables(self) -> List[str]:
+        """Get list of all tables in database."""
+```
+
+#### `PgConfig`
+PostgreSQL connection configuration.
+
+```python
+@dataclass
+class PgConfig:
+    host: str = os.getenv('PGSQL_HOST', '')
+    port: str = os.getenv('PGSQL_PORT', '5432') 
+    user: str = os.getenv('PGSQL_USER', '')
+    password: str = os.getenv('PGSQL_PASS', '')
+    dbname: str = os.getenv('PGSQL_NAME', '')
+    
+    def uri(self) -> str:
+        """Generate connection URI string."""
+```
+
+### Utility Functions
+
+#### `quick_upsert(dataframe, table_name, connection_string=None, **kwargs) -> bool`
+One-line upsert for simple use cases.
+
+#### `test_connection(config=None, engine=None) -> Tuple[bool, str]`
+Test database connectivity and return (success, message).
 
 ## 🤝 Contributing
 
