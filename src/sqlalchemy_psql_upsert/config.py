@@ -6,11 +6,11 @@ using environment variables. It supports automatic loading of environment variab
 from .env files and provides a convenient way to construct database URIs.
 
 Environment Variables:
-    PGSQL_HOST: PostgreSQL server hostname or IP address
-    PGSQL_PORT: PostgreSQL server port (default: 5432)
-    PGSQL_USER: Database username for authentication
-    PGSQL_PASS: Database password for authentication
-    PGSQL_NAME: Name of the target database
+    PGHOST: PostgreSQL server hostname or IP address
+    PGPORT: PostgreSQL server port (default: 5432)
+    PGDATABASE: Name of the target database
+    PGUSER: Database username for authentication
+    PGPASSWORD: Database password for authentication
 
 Example:
     >>> from sqlalchemy_psql_upsert.config import PgConfig
@@ -41,11 +41,11 @@ class PgConfig:
         dbname: Name of the target database
 
     Environment Variables:
-        PGSQL_HOST: Sets the host attribute
-        PGSQL_PORT: Sets the port attribute (default: "5432")
-        PGSQL_USER: Sets the user attribute
-        PGSQL_PASS: Sets the password attribute
-        PGSQL_NAME: Sets the dbname attribute
+        PGHOST: Sets the host attribute
+        PGPORT: Sets the port attribute (default: "5432")
+        PGDATABASE: Sets the dbname attribute
+        PGUSER: Sets the user attribute
+        PGPASSWORD: Sets the password attribute
 
     Example:
         >>> config = PgConfig()
@@ -56,11 +56,11 @@ class PgConfig:
         The port is stored as a string to match the format expected by
         database URI construction and environment variable parsing.
     """
-    host: str = os.getenv('PGSQL_HOST', '')
-    port: str = os.getenv('PGSQL_PORT', '5432')
-    user: str = os.getenv('PGSQL_USER', '')
-    password: str = os.getenv('PGSQL_PASS', '')
-    dbname: str = os.getenv('PGSQL_NAME', '')
+    host: str = os.getenv('PGHOST', '')
+    port: str = os.getenv('PGPORT', '5432')
+    dbname: str = os.getenv('PGDATABASE', '')
+    user: str = os.getenv('PGUSER', '')
+    password: str = os.getenv('PGPASSWORD', '')
 
     def uri(self) -> str:
         """
@@ -76,9 +76,9 @@ class PgConfig:
         Example:
             >>> config = PgConfig()
             >>> config.host = "localhost"
+            >>> config.dbname = "mydb"
             >>> config.user = "myuser"
             >>> config.password = "mypass"
-            >>> config.dbname = "mydb"
             >>> config.uri()
             'postgresql+psycopg2://myuser:mypass@localhost:5432/mydb'
 
