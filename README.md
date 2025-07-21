@@ -99,11 +99,11 @@ Create a `.env` file or set the following environment variables:
 
 ```bash
 # PostgreSQL Configuration
-PGSQL_HOST=localhost
-PGSQL_PORT=5432
-PGSQL_USER=your_username
-PGSQL_PASS=your_password
-PGSQL_NAME=your_database
+PGHOST = localhost
+PGPORT = 5432
+PGDATABASE = your_database
+PGUSER = your_username
+PGPASSWORD = your_password
 ```
 
 ### Configuration Class
@@ -210,11 +210,11 @@ PostgreSQL connection configuration.
 ```python
 @dataclass
 class PgConfig:
-    host: str = os.getenv('PGSQL_HOST', '')
-    port: str = os.getenv('PGSQL_PORT', '5432') 
-    user: str = os.getenv('PGSQL_USER', '')
-    password: str = os.getenv('PGSQL_PASS', '')
-    dbname: str = os.getenv('PGSQL_NAME', '')
+    host: str = os.getenv('PGHOST', '')
+    port: str = os.getenv('PGPORT', '5432') 
+    dbname: str = os.getenv('PGDATABASE', '')
+    user: str = os.getenv('PGUSER', '')
+    password: str = os.getenv('PGPASSWORD', '')
     
     def uri(self) -> str:
         """Generate connection URI string."""
