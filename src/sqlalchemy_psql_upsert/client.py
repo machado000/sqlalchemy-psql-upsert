@@ -1,5 +1,5 @@
 """
-main.py - Main script for upserting data to PostgreSQL tables.
+client.py - PostgreSQL upsert client implementation.
 
 This module provides PostgreSQL upsert functionality with support for:
 - Automatic conflict detection and resolution
