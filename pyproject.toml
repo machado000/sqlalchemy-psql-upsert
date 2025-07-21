@@ -1,6 +1,6 @@
 [project]
 name = "sqlalchemy-psql-upsert"
-version = "1.0.1"
+version = "1.0.2"
 description = "PostgreSQL upsert library with intelligent conflict resolution and multi-threaded processing"
 authors = [{name = "Joao Brito"}]
 readme = "README.md"
@@ -17,7 +17,7 @@ keywords = [
     "pandas"
 ]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Intended Audience :: System Administrators", 
     "License :: OSI Approved :: MIT License",
@@ -52,7 +52,6 @@ requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
-name = "sqlalchemy-psql-upsert"
 packages = [{ include = "sqlalchemy_psql_upsert", from = "src" }]
 
 [project.urls]
