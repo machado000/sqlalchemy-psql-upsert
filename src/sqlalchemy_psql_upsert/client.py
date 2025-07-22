@@ -3,6 +3,7 @@ client.py - PostgreSQL upsert client implementation.
 
 This module provides PostgreSQL upsert functionality with support for:
 - Automatic conflict detection and resolution
+- Automatic NaN to NULL conversion for pandas DataFrames
 - Multi-threaded chunk processing
 - Progress tracking with tqdm
 - Comprehensive constraint handling (PK, UNIQUE)
@@ -29,7 +30,8 @@ class PostgresqlUpsert:
     PostgreSQL upsert utility class with support for conflict resolution and multi-threading.
 
     This class provides methods to upsert pandas DataFrames into PostgreSQL tables with
-    automatic handling of primary key and unique constraint conflicts.
+    automatic handling of primary key and unique constraint conflicts. All pandas NaN
+    values (np.nan, pd.NaType, None) are automatically converted to PostgreSQL NULL values.
     """
 
     def __init__(self, config: Optional['PgConfig'] = None, engine: Optional[Engine] = None,
@@ -278,6 +280,12 @@ class PostgresqlUpsert:
         """
         Convert pandas DataFrame to list of dictionaries with NaN values converted to None.
 
+        This method handles all pandas NaN variants including:
+        - numpy.nan (np.nan)
+        - pandas._libs.missing.NAType (pd.NA)
+        - Python None
+        - float('nan')
+
         Args:
             chunk: DataFrame chunk to convert
 
@@ -300,6 +308,9 @@ class PostgresqlUpsert:
                    uniques: List[List[str]]) -> None:
         """
         Execute upsert for a single chunk of data.
+
+        This method converts all NaN values to None before executing the upsert operation,
+        ensuring proper NULL handling in PostgreSQL for both INSERT and UPDATE operations.
 
         Args:
             chunk: DataFrame chunk to upsert
@@ -368,6 +379,12 @@ class PostgresqlUpsert:
                          remove_multi_conflict_rows: bool = True) -> bool:
         """
         Upsert a pandas DataFrame into a PostgreSQL table with conflict resolution.
+
+        This method automatically handles:
+        - Primary key and unique constraint conflicts using PostgreSQL's ON CONFLICT clause
+        - NaN value conversion: All pandas NaN values are converted to PostgreSQL NULL
+        - Multi-threaded processing for large datasets
+        - Progress tracking with visual progress bars
 
         Args:
             dataframe: Input DataFrame to upsert

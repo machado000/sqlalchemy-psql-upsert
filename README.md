@@ -8,10 +8,16 @@
 
 A Python library for intelligent PostgreSQL upsert operations with advanced conflict resolution and multi-threaded processing.
 
+## 🆕 What's New in v1.0.3
+
+- **Automatic NaN to NULL conversion**: All pandas NaN values (np.nan, pd.NaType, None) are now automatically converted to PostgreSQL NULL values during upsert operations
+- **Improved data integrity**: Better handling of missing/null data in DataFrames
+
 ## 🚀 Features
 
 - **Multi-constraint conflict detection**: Automatically handles primary key, unique constraints, and composite constraints
 - **Smart conflict filtering**: Removes rows that would conflict with multiple existing records
+- **Automatic NaN to NULL conversion**: Seamlessly converts pandas NaN values to PostgreSQL NULL values
 - **Multi-threaded processing**: Parallel chunk processing for large datasets
 - **Configurable batch sizes**: Optimize memory usage and processing speed
 - **Schema validation**: Automatic table and column validation before operations
@@ -21,7 +27,7 @@ A Python library for intelligent PostgreSQL upsert operations with advanced conf
 
 ### Using Poetry (Recommended)
 ```bash
-poetry install sqlalchemy_psql_upsert
+poetry add sqlalchemy-psql-upsert
 ```
 
 ### Using pip
@@ -89,6 +95,27 @@ upserter.upsert_dataframe(
     max_workers=8,             # More workers for better parallelism
     remove_multi_conflict_rows=True  # Remove problematic rows
 )
+```
+
+### Data Type Handling
+
+The library automatically handles pandas data type conversions:
+
+```python
+import pandas as pd
+import numpy as np
+
+# DataFrame with NaN values
+df = pd.DataFrame({
+    'id': [1, 2, 3, 4],
+    'name': ['Alice', 'Bob', None, 'David'],      # None values
+    'score': [85.5, np.nan, 92.0, 88.1],         # NaN values
+    'active': [True, False, None, True]           # Mixed types with None
+})
+
+# All NaN and None values are automatically converted to PostgreSQL NULL
+upserter.upsert_dataframe(df, 'users')
+# Result: NaN/None → NULL in PostgreSQL
 ```
 
 ## ⚙️ Configuration
@@ -164,6 +191,7 @@ Consider a table with these constraints:
 - **Transaction scope**: Each chunk is processed in its own transaction
 
 ### Best Practices
+- **Data preparation**: NaN values are automatically converted to NULL - no manual preprocessing needed
 - **Chunk sizing**: Start with 10,000 rows per chunk, adjust based on your data and hardware
 - **Worker count**: Use 2-4 workers per CPU core, but test with your specific workload
 - **Memory monitoring**: Monitor memory usage with large datasets
@@ -245,6 +273,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 🙋 Support
 
-- **Issues**: [GitHub Issues](https://github.com/yourusername/sqlalchemy-upsert/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/yourusername/sqlalchemy-upsert/discussions)
+- **Issues**: [GitHub Issues](https://github.com/machado000/sqlalchemy-psql-upsert/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/machado000/sqlalchemy-psql-upsert/discussions)
 - **Documentation**: Check the docstrings and test files for detailed usage examples
