@@ -64,7 +64,7 @@ class PgConfig:
 
     def uri(self) -> str:
         """
-        Generate a PostgreSQL connection URI string.
+        Generate a PostgreSQL connection URI string (Uniform Resource Identifier).
 
         Constructs a SQLAlchemy-compatible PostgreSQL connection URI using the
         psycopg2 driver from the configured connection parameters.
