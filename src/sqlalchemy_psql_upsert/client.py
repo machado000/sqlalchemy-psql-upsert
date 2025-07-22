@@ -113,14 +113,12 @@ class PostgresqlUpsert:
 
             # If PK columns exist and are in DataFrame, include them
             if pk_cols and all(c in dataframe.columns for c in pk_cols):
-                logger.debug(f"Primary key constraint {pk_cols} will be used for upsert")
                 return pk_cols, [pk_cols] + unique_sets
             else:
                 if pk_cols:
-                    logger.warning(f"Primary key columns {pk_cols} not found in DataFrame columns, "
-                                   f"will rely on unique constraints only")
+                    logger.debug(f"Primary key columns {pk_cols} not found in DataFrame columns")
 
-            logger.info(f"Found {len(unique_sets)} usable unique constraints for upsert operations")
+            logger.debug(f"Found {len(unique_sets)} usable unique constraints for upsert operations")
             return pk_cols, unique_sets
 
         except Exception as e:
@@ -276,6 +274,28 @@ class PostgresqlUpsert:
 
         return dataframe.drop(index=to_remove)
 
+    def _convert_nan_to_none(self, chunk: pd.DataFrame) -> List[Dict]:
+        """
+        Convert pandas DataFrame to list of dictionaries with NaN values converted to None.
+
+        Args:
+            chunk: DataFrame chunk to convert
+
+        Returns:
+            List of dictionaries with NaN values converted to None (which becomes NULL in PostgreSQL)
+        """
+        # Convert DataFrame to records, then replace NaN with None
+        records = chunk.to_dict(orient='records')
+
+        # Replace NaN values with None (handles pd.NaType, np.nan, float('nan'), etc.)
+        for record in records:
+            for key, value in record.items():
+                if pd.isna(value):
+                    record[key] = None
+                    logger.debug(f"Converted NaN to None for column '{key}'")
+
+        return records
+
     def _do_upsert(self, chunk: pd.DataFrame, table: Table, pk_cols: List[str],
                    uniques: List[List[str]]) -> None:
         """
@@ -297,8 +317,16 @@ class PostgresqlUpsert:
 
         logger.debug(f"Processing chunk with {len(chunk)} rows")
 
-        insert_stmt = insert(table).values(chunk.to_dict(orient='records'))
-        update_cols = {c.name: insert_stmt.excluded[c.name] for c in table.columns if c.name not in pk_cols}
+        # Convert NaN values to None before creating the insert statement
+        records = self._convert_nan_to_none(chunk)
+
+        insert_stmt = insert(table).values(records)
+
+        # Create update columns for conflict resolution
+        update_cols = {}
+        for c in table.columns:
+            if c.name not in pk_cols:
+                update_cols[c.name] = insert_stmt.excluded[c.name]
 
         stmt = None
         for constraint in uniques:
@@ -361,6 +389,7 @@ class PostgresqlUpsert:
             return True
 
         logger.info(f"Starting upsert operation for {len(dataframe)} rows into {schema}.{table_name}")
+
         df = dataframe.copy()
 
         inspector = inspect(self.engine)
