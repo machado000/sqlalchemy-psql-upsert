@@ -189,6 +189,7 @@ Consider a table with these constraints:
 - **Memory usage**: Large datasets are processed in memory (chunked processing helps)
 - **Complex constraints**: Some exotic PostgreSQL constraint types may not be fully supported
 - **Transaction scope**: Each chunk is processed in its own transaction
+- **Fail-fast behavior**: Any chunk failure will stop the entire operation and raise an exception
 
 ### Best Practices
 - **Data preparation**: NaN values are automatically converted to NULL - no manual preprocessing needed
@@ -196,6 +197,7 @@ Consider a table with these constraints:
 - **Worker count**: Use 2-4 workers per CPU core, but test with your specific workload
 - **Memory monitoring**: Monitor memory usage with large datasets
 - **Index considerations**: Ensure proper indexing on conflict columns for optimal performance
+- **Error handling**: Wrap upsert operations in try-catch blocks as any chunk failure will raise an exception
 
 ## � Testing
 
@@ -249,9 +251,6 @@ class PgConfig:
 ```
 
 ### Utility Functions
-
-#### `quick_upsert(dataframe, table_name, connection_string=None, **kwargs) -> bool`
-One-line upsert for simple use cases.
 
 #### `test_connection(config=None, engine=None) -> Tuple[bool, str]`
 Test database connectivity and return (success, message).

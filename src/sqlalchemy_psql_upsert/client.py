@@ -319,8 +319,8 @@ class PostgresqlUpsert:
             uniques: List of unique constraint column lists
 
         Raises:
-            OperationalError: For transient database errors (retries automatically)
-            Exception: For permanent errors
+            OperationalError: For transient database errors that exceed max retries
+            Exception: For any permanent database errors
         """
         if chunk.empty:
             logger.warning("Received empty chunk for upsert, skipping")
@@ -370,9 +370,11 @@ class PostgresqlUpsert:
                 time.sleep(wait_time)
             except Exception as e:
                 logger.error(f"Permanent error processing chunk: {e}")
-                return
+                raise
 
-        logger.error(f"Max retries ({max_retries}) reached for chunk, operation failed")
+        error_msg = f"Max retries ({max_retries}) reached for chunk, operation failed"
+        logger.error(error_msg)
+        raise OperationalError(error_msg, None, None)
 
     def upsert_dataframe(self, dataframe: pd.DataFrame, table_name: str, schema: str = "public",
                          chunk_size: int = 10_000, max_workers: int = 4,
@@ -395,11 +397,12 @@ class PostgresqlUpsert:
             remove_multi_conflict_rows: Whether to remove rows with multiple conflicts
 
         Returns:
-            True if successful, raises exceptions on failure
+            True if all chunks are processed successfully
 
         Raises:
             ValueError: If table doesn't exist or other validation errors
-            Exception: For database errors during operation
+            OperationalError: For database connection or transient errors after retries
+            Exception: For any database errors during chunk processing (fails fast)
         """
         if dataframe.empty:
             logger.warning("Received empty DataFrame. Skipping upsert.")
@@ -461,15 +464,13 @@ class PostgresqlUpsert:
                         if exc := future.exception():
                             logger.error(f"Chunk {start}:{end} failed: {exc}")
                             failed_chunks += 1
+                            # Raise the first encountered exception to fail fast
+                            raise exc
                         else:
                             logger.debug(f"Chunk {start}:{end} upserted successfully.")
                             successful_chunks += 1
                         row_pbar.update(chunk_size_actual)
                         chunk_pbar.update(1)
 
-        if failed_chunks > 0:
-            logger.warning(f"Upsert completed with {failed_chunks} failed chunks out of {num_chunks} total chunks")
-        else:
-            logger.info(f"Upsert completed successfully. {successful_chunks} chunks processed.")
-
+        logger.info(f"Upsert completed successfully. {successful_chunks} chunks processed.")
         return True
