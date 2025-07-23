@@ -1,6 +1,6 @@
 [project]
 name = "sqlalchemy-psql-upsert"
-version = "1.0.3"
+version = "1.0.4"
 description = "PostgreSQL upsert library with intelligent conflict resolution and multi-threaded processing"
 authors = [{name = "Joao Brito"}]
 readme = "README.md"
