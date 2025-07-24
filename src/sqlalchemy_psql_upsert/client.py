@@ -1,24 +1,21 @@
 """
-client.py - PostgreSQL upsert client implementation.
+client.py - PostgreSQL upsert client implementation with temporary table approach.
 
 This module provides PostgreSQL upsert functionality with support for:
-- Automatic conflict detection and resolution
-- Automatic NaN to NULL conversion for pandas DataFrames
-- Multi-threaded chunk processing
-- Progress tracking with tqdm
+- Temporary table + JOIN based conflict resolution
 - Comprehensive constraint handling (PK, UNIQUE)
+- Automatic NaN to NULL conversion for pandas DataFrames
+- Efficient bulk operations using SQLAlchemy
+- Progress tracking with tqdm
 """
 
 import logging
 import pandas as pd
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from sqlalchemy import create_engine, inspect, text, bindparam
-from sqlalchemy import Engine, MetaData, Table
-from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.exc import OperationalError
+import uuid
+from sqlalchemy import create_engine, inspect, text, insert
+from sqlalchemy import Engine, MetaData, Table, UniqueConstraint
 from tqdm import tqdm
-from typing import Dict, List, Set, Tuple, Optional, Union
+from typing import List, Tuple, Optional
 from .config import PgConfig
 
 logger = logging.getLogger(__name__)
@@ -30,8 +27,9 @@ class PostgresqlUpsert:
     PostgreSQL upsert utility class with support for conflict resolution and multi-threading.
 
     This class provides methods to upsert pandas DataFrames into PostgreSQL tables with
-    automatic handling of primary key and unique constraint conflicts. All pandas NaN
-    values (np.nan, pd.NaType, None) are automatically converted to PostgreSQL NULL values.
+    automatic handling of primary key and unique constraint conflicts using a temporary
+    table approach. All pandas NaN values (np.nan, pd.NaType, None) are automatically
+    converted to PostgreSQL NULL values.
     """
 
     def __init__(self, config: Optional['PgConfig'] = None, engine: Optional[Engine] = None,
@@ -46,6 +44,7 @@ class PostgresqlUpsert:
 
         Raises:
             ValueError: If neither config nor engine is provided and default config fails.
+            PermissionError: If database user lacks CREATE TEMP TABLE privileges.
         """
         if engine:
             self.engine = engine
@@ -59,13 +58,16 @@ class PostgresqlUpsert:
             logger.setLevel(logging.DEBUG)
             logger.info("Debug logging enabled for PostgreSQL upsert operations")
 
+        # Verify temporary table creation privileges
+        self._verify_temp_table_privileges()
+
     def create_engine(self) -> Engine:
         """Create a new SQLAlchemy engine using default configuration."""
         uri = PgConfig().uri()
         logger.debug(f"Creating new database engine with URI: {uri}")
         return create_engine(uri)
 
-    def list_tables(self) -> List[str]:
+    def _list_tables(self) -> List[str]:
         """
         Get a list of all table names in the database.
 
@@ -77,208 +79,114 @@ class PostgresqlUpsert:
         logger.debug(f"Found {len(tables)} tables in database: {tables}")
         return tables
 
-    def _get_constraints(self, dataframe: pd.DataFrame, table_name: str,
-                         schema: str = "public") -> Tuple[List[str], List[List[str]]]:
+    def _verify_temp_table_privileges(self) -> None:
+        """
+        Verify that the database user has privileges to create temporary tables.
+
+        Note: The test temp table is not explicitly dropped as it will be automatically
+        cleaned up when the session ends. This avoids issues where users have CREATE
+        privileges but not DROP privileges.
+
+        Raises:
+            PermissionError: If the user lacks CREATE TEMP TABLE privileges.
+        """
+        test_temp_table = f"test_temp_privileges_{uuid.uuid4().hex[:8]}"
+
+        try:
+            with self.engine.begin() as conn:
+                # Try to create a minimal test temporary table
+                conn.execute(text(f'CREATE TEMP TABLE "{test_temp_table}" (test_col INTEGER)'))
+                # Note: Not explicitly dropping - PostgreSQL will auto-cleanup on session end
+
+            logger.debug("Temporary table creation privileges verified successfully")
+
+        except Exception as e:
+            error_msg = (
+                f"Database user lacks CREATE TEMP TABLE privileges. "
+                f"Error: {str(e)}. "
+                f"Please ensure your PostgreSQL user has TEMPORARY privilege on the database, "
+                f"or grant it with: GRANT TEMPORARY ON DATABASE your_database TO your_user;"
+            )
+            logger.error(error_msg)
+            raise PermissionError(error_msg) from e
+
+    def _get_constraints(self, table_name: str, schema: str = "public") -> Tuple[List[str], List[List[str]]]:
         """
         Get primary key and unique constraints for a table.
 
         Args:
-            dataframe: DataFrame to check column compatibility against
             table_name: Name of the target table
             schema: Database schema name
 
         Returns:
             Tuple of (primary_key_columns, list_of_unique_constraint_columns)
         """
-        if dataframe.empty:
-            logger.warning("Received empty DataFrame for constraint analysis, returning empty constraints")
-            return [], []
-
         try:
-            inspector = inspect(self.engine)
-            pk_constraint = inspector.get_pk_constraint(table_name, schema)
-            pk_cols = pk_constraint.get('constrained_columns', [])
-            uniques = inspector.get_unique_constraints(table_name, schema)
+            metadata = MetaData()
+            target_table = Table(table_name, metadata, autoload_with=self.engine, schema=schema)
 
-            logger.debug(f"Retrieved constraints for {schema}.{table_name}: "
-                         f"PK={pk_cols}, unique_constraints={len(uniques)}")
+            pk_cols = [col.name for col in target_table.primary_key.columns]
 
-            # Filter unique constraints to only include those with columns present in DataFrame
-            unique_sets = []
-            for u in uniques:
-                constraint_cols = u['column_names']
-                if all(col in dataframe.columns for col in constraint_cols):
-                    unique_sets.append(constraint_cols)
-                else:
-                    logger.debug(f"Skipping unique constraint {constraint_cols} - "
-                                 f"columns not present in DataFrame")
+            uniques = []
+            for constraint in target_table.constraints:
+                if isinstance(constraint, UniqueConstraint):
+                    constraint_cols = [col.name for col in constraint.columns]
+                    uniques.append(constraint_cols)
 
-            # If PK columns exist and are in DataFrame, include them
-            if pk_cols and all(c in dataframe.columns for c in pk_cols):
-                return pk_cols, [pk_cols] + unique_sets
-            else:
-                if pk_cols:
-                    logger.debug(f"Primary key columns {pk_cols} not found in DataFrame columns")
+            # Sort unique constraints by first column name for consistent ordering
+            uniques.sort(key=lambda x: x[0])
 
-            logger.debug(f"Found {len(unique_sets)} usable unique constraints for upsert operations")
-            return pk_cols, unique_sets
+            if not pk_cols and not uniques:
+                logger.warning(f"No PK or UNIQUE constraints found on '{schema}.{table_name}'.")
+                return [], []
+
+            logger.debug(f"Retrieved constraints for {schema}.{table_name}: PK={pk_cols}, Uniques={uniques}")
+
+            return (pk_cols, uniques)
 
         except Exception as e:
             logger.error(f"Failed to retrieve constraints for table {schema}.{table_name}: {str(e)}")
             raise
 
-    def _check_conflicts(self, dataframe: pd.DataFrame, constraint: Union[str, List[str]],
-                         table_name: str, schema: str = "public") -> Dict[int, Set[Tuple]]:
+    def _get_dataframe_constraints(self, dataframe: pd.DataFrame, table_name: str,
+                                   schema: str = "public") -> Tuple[List[str], List[List[str]]]:
         """
-        For each row in the DataFrame, return a mapping from DataFrame index to set of matched
-        table row identifiers (PK tuple or ctid) in the table.
-
-        Args:
-            dataframe: Input DataFrame to check for conflicts
-            constraint: Column name(s) that form the constraint
-            table_name: Target database table name
-            schema: Database schema name
-
-        Returns:
-            Dictionary mapping DataFrame index to set of table row identifiers
-        """
-
-        cols = [constraint] if isinstance(constraint, str) else (constraint or [])
-        if not cols:
-            logger.warning("No constraint columns provided, skipping _check_conflicts.")
-            return {}
-
-        inspector = inspect(self.engine)
-        table_columns = {col['name'] for col in inspector.get_columns(table_name, schema=schema)}
-        pk_cols = inspector.get_pk_constraint(table_name, schema).get('constrained_columns', [])
-
-        df_columns = set(dataframe.columns)
-        if not all(col in df_columns and col in table_columns for col in cols):
-            logger.warning(f"Constraint {cols} columns not present in both DataFrame and "
-                           f"table {schema}.{table_name}, skipping _check_conflicts.")
-            return {}
-
-        df_subset = dataframe[cols]
-        if df_subset.empty:
-            logger.warning("Empty subset dataframe to check for conflicts, skipping _check_conflicts.")
-            return {}
-
-        # Sanitize identifiers (basic)
-        safe_cols = [f'"{col}"' for col in cols]
-        safe_table = f'"{schema}"."{table_name}"'
-
-        # Determine identifier columns: PK or ctid
-        if pk_cols:
-            id_cols = [f'"{col}"' for col in pk_cols]
-        else:
-            id_cols = ['ctid']
-
-        select_cols = id_cols + safe_cols
-        select_cols_str = ', '.join(select_cols)
-
-        # Write WHERE clause for single or multiple constraint columns
-        if len(cols) == 1:
-            vals = df_subset[cols[0]].tolist()
-            where_clause = f"{safe_cols[0]} IN :vals"
-        else:
-            vals = [tuple(row) for row in df_subset[cols].to_numpy()]
-            col_tuple = f"({', '.join(safe_cols)})"
-            where_clause = f"{col_tuple} IN :vals"
-
-        query = text(f"""
-            SELECT {select_cols_str}
-            FROM {safe_table}
-            WHERE {where_clause}
-        """).bindparams(bindparam('vals', expanding=True))
-
-        with self.engine.connect() as conn:
-            result = conn.execute(query, {'vals': vals})
-
-            # Build mapping: constraint tuple -> set of PK/ctid tuples
-            table_row_map = {}
-            for row in result.fetchall():
-                id_val = tuple(row[:len(id_cols)])
-                constraint_val = tuple(row[len(id_cols):])
-                table_row_map.setdefault(constraint_val, set()).add(id_val)
-
-        # Build mapping: DataFrame index -> set of matched table row identifiers (PK/ctid)
-        index_to_table_rows = {}
-        for idx, row in df_subset.iterrows():
-            key = tuple(row) if len(cols) > 1 else (row.iloc[0],)
-            if key in table_row_map:
-                index_to_table_rows[idx] = table_row_map[key]
-
-        logger.debug(f"Found {len(index_to_table_rows)} DataFrame rows with conflicts in table")
-        return index_to_table_rows
-
-    def _remove_multi_conflict_rows(self, dataframe: pd.DataFrame, table_name: str,
-                                    schema: str = "public",
-                                    max_workers: int = 4) -> pd.DataFrame:
-        """
-        Remove DataFrame rows that match more than one unique table row (across all unique constraints),
-        using the dict[int, set[tuple]] output from _check_conflicts.
-
-        Args:
-            dataframe: Input DataFrame to filter
-            table_name: Target database table name
-            schema: Database schema name
-            max_workers: Maximum number of threads for parallel constraint checking
-
-        Returns:
-            Filtered DataFrame with multi-conflict rows removed
+        Get constraints that are applicable to the given DataFrame.
+        Only returns constraints where ALL required columns are present in DataFrame.
         """
         if dataframe.empty:
-            logger.warning("Received empty DataFrame, skipping multi-conflict removal.")
-            return dataframe
+            logger.warning("Received empty DataFrame for constraint analysis, returning empty constraints")
+            return [], []
 
-        _, uniques = self._get_constraints(dataframe, table_name, schema)
-        if not uniques:
-            logger.warning(f"No unique constraints found for table {table_name}, "
-                           f"skipping multi-conflict removal.")
-            return dataframe
+        try:
+            pk_cols, uniques = self._get_constraints(table_name, schema)
 
-        # For each DataFrame index, collect all matched PK/ctid tuples across all constraints
-        index_to_table_rows: Dict[int, Set[Tuple]] = {}
+            # Check PK: only include if ALL PK columns are present
+            filtered_pk = pk_cols if pk_cols and all(col in dataframe.columns for col in pk_cols) else []
 
-        def worker(constraint: List[str]) -> Dict[int, Set[Tuple]]:
-            try:
-                return self._check_conflicts(dataframe, constraint, table_name, schema)
-            except Exception as e:
-                logger.warning(f"Constraint {constraint} check failed: {e}")
-                return {}
+            if pk_cols and not filtered_pk:
+                missing_pk_cols = [col for col in pk_cols if col not in dataframe.columns]
+                logger.debug(f"Primary key columns {missing_pk_cols} not found in DataFrame columns")
 
-        logger.info(f"Checking {len(uniques)} unique constraints for multi-conflicts "
-                    f"using {max_workers} workers")
+            # Check unique constraints: only include if ALL constraint columns are present
+            filtered_uniques = []
+            for constraint_cols in uniques:
+                if all(col in dataframe.columns for col in constraint_cols):
+                    filtered_uniques.append(constraint_cols)
+                else:
+                    missing_cols = [col for col in constraint_cols if col not in dataframe.columns]
+                    logger.debug(f"Skipping unique constraint {constraint_cols} - missing columns: {missing_cols}")
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(worker, c): c for c in uniques}
-            for future in as_completed(futures):
-                constraint = futures[future]
-                try:
-                    result = future.result()
-                    for idx, pk_set in result.items():
-                        if idx not in index_to_table_rows:
-                            index_to_table_rows[idx] = set()
-                        index_to_table_rows[idx].update(pk_set)
-                except Exception as e:
-                    logger.error(f"Thread processing constraint {constraint} failed: {e}")
+            logger.debug(f"Found {len(filtered_uniques)} usable unique constraints for upsert operations")
+            return filtered_pk, filtered_uniques
 
-        # Remove rows that match more than one unique table row (i.e., set size > 1)
-        to_remove = [idx for idx, pk_set in index_to_table_rows.items() if len(pk_set) > 1]
+        except Exception as e:
+            logger.error(f"Failed to retrieve constraints for dataframe: {str(e)}")
+            raise
 
-        removed_df = dataframe.loc[to_remove]
-
-        if not removed_df.empty:
-            logger.warning(f"{len(removed_df)} rows removed due to multiple unique constraint conflicts")
-            logger.debug(f"Removed rows:\n{removed_df}")
-        else:
-            logger.info("No multi-conflict rows found, all data will be processed")
-
-        return dataframe.drop(index=to_remove)
-
-    def _convert_nan_to_none(self, chunk: pd.DataFrame) -> List[Dict]:
+    def _convert_nan_to_none(self, dataframe: pd.DataFrame) -> pd.DataFrame:
         """
-        Convert pandas DataFrame to list of dictionaries with NaN values converted to None.
+        Convert pandas DataFrame NaN values to None.
 
         This method handles all pandas NaN variants including:
         - numpy.nan (np.nan)
@@ -287,190 +195,365 @@ class PostgresqlUpsert:
         - float('nan')
 
         Args:
-            chunk: DataFrame chunk to convert
+            dataframe: DataFrame to convert
 
         Returns:
-            List of dictionaries with NaN values converted to None (which becomes NULL in PostgreSQL)
+            DataFrame with NaN values converted to None (which becomes NULL in PostgreSQL)
         """
-        # Convert DataFrame to records, then replace NaN with None
-        records = chunk.to_dict(orient='records')
+        if dataframe.empty or dataframe is None:
+            logger.warning("Received empty DataFrame. Skipping NaN conversion.")
+            return dataframe
 
-        # Replace NaN values with None (handles pd.NaType, np.nan, float('nan'), etc.)
-        for record in records:
-            for key, value in record.items():
-                if pd.isna(value):
-                    record[key] = None
-                    logger.debug(f"Converted NaN to None for column '{key}'")
+        try:
+            df = dataframe.copy()
 
-        return records
+            # Replace all NaN variants with None
+            for col in df.columns:
+                df[col] = df[col].where(pd.notna(df[col]), None)
 
-    def _do_upsert(self, chunk: pd.DataFrame, table: Table, pk_cols: List[str],
-                   uniques: List[List[str]]) -> None:
+            logger.debug(f"Converted NaN values to None for {len(df.columns)} columns")
+            return df
+
+        except Exception as e:
+            logger.error(f"Failed to convert NaN values to None: {e}")
+            raise
+
+    def _create_temp_table(self, dataframe: pd.DataFrame, target_table_name: str,
+                           schema: str = "public") -> str:
         """
-        Execute upsert for a single chunk of data.
-
-        This method converts all NaN values to None before executing the upsert operation,
-        ensuring proper NULL handling in PostgreSQL for both INSERT and UPDATE operations.
+        Create a temporary table with the same structure as the target table.
 
         Args:
-            chunk: DataFrame chunk to upsert
-            table: SQLAlchemy Table object
-            pk_cols: Primary key column names
-            uniques: List of unique constraint column lists
+            dataframe: DataFrame to determine column types
+            target_table_name: Name of the target table to copy structure from
+            schema: Database schema name
+
+        Returns:
+            Name of the created temporary table
+        """
+        # Generate unique temp table name
+        temp_table_name = f"temp_upsert_{uuid.uuid4().hex[:8]}"
+
+        try:
+            # Get target table structure
+            metadata = MetaData()
+            target_table = Table(target_table_name, metadata, autoload_with=self.engine, schema=schema)
+
+            # Create CREATE TABLE statement for temp table
+            columns_def = []
+            for col in target_table.columns:
+                if col.name in dataframe.columns:
+                    col_type = str(col.type.compile(dialect=self.engine.dialect))
+                    columns_def.append(f'"{col.name}" {col_type}')
+
+            columns_str = ", ".join(columns_def)
+
+            create_temp_sql = f"""
+                CREATE TEMP TABLE "{temp_table_name}" (
+                    {columns_str}
+                )
+            """
+
+            with self.engine.begin() as conn:
+                conn.execute(text(create_temp_sql))
+
+            logger.debug(f"Created temporary table: {temp_table_name}")
+            return temp_table_name
+
+        except Exception as e:
+            logger.error(f"Failed to create temporary table: {e}")
+            raise
+
+    def _insert_into_temp_table(self, dataframe: pd.DataFrame, temp_table_name: str) -> Tuple[bool, int]:
+        """
+        Insert all DataFrame data into the temporary table using SQLAlchemy.
+
+        Args:
+            dataframe: DataFrame to insert
+            temp_table_name: Name of the temporary table
+
+        Returns:
+            Tuple of (success: bool, affected_rows: int)
 
         Raises:
-            OperationalError: For transient database errors that exceed max retries
-            Exception: For any permanent database errors
+            Exception: If insertion fails for any reason
         """
-        if chunk.empty:
-            logger.warning("Received empty chunk for upsert, skipping")
-            return
+        try:
+            # Convert NaN to None
+            df_clean = self._convert_nan_to_none(dataframe)
 
-        logger.debug(f"Processing chunk with {len(chunk)} rows")
+            # Convert DataFrame to list of dictionaries
+            records = df_clean.to_dict('records')
 
-        # Convert NaN values to None before creating the insert statement
-        records = self._convert_nan_to_none(chunk)
+            if not records:
+                logger.debug("No records to insert into temporary table")
+                return True, 0
 
-        insert_stmt = insert(table).values(records)
+            # Get temp table metadata for SQLAlchemy insert
+            metadata = MetaData()
+            temp_table = Table(temp_table_name, metadata, autoload_with=self.engine)
 
-        # Create update columns for conflict resolution
-        update_cols = {}
-        for c in table.columns:
-            if c.name not in pk_cols:
-                update_cols[c.name] = insert_stmt.excluded[c.name]
+            # Use SQLAlchemy's insert construct for bulk insert
+            insert_stmt = insert(temp_table).values(records)
 
-        stmt = None
-        for constraint in uniques:
-            if all(col in chunk.columns for col in constraint):
-                stmt = insert_stmt.on_conflict_do_update(
-                    index_elements=constraint,
-                    set_=update_cols
+            with self.engine.begin() as conn:
+                result = conn.execute(insert_stmt)
+                affected_rows = result.rowcount
+
+            logger.debug(f"INSERT temporary table operation completed successfully, affected {affected_rows} rows")
+
+            return True, affected_rows
+
+        except Exception as e:
+            logger.error(f"Failed to insert data into temporary table {temp_table_name}: {e}")
+            raise
+
+    def _resolve_conflicts_with_temp_table(self, temp_table_name: str, target_table_name: str,
+                                           schema: str = "public") -> Tuple[bool, int]:
+        """
+        Resolve conflicts between temporary table and target table using advanced MERGE with CTEs.
+
+        This method handles sophisticated upsert logic with comprehensive conflict resolution:
+        1. Analyze all conflicts across all constraints simultaneously
+        2. Filter out rows that conflict with multiple target rows (ambiguous)
+        3. Deduplicate temp rows that target the same existing row
+        4. Use PostgreSQL MERGE for atomic upsert operation
+        5. Track and log all skipped rows with reasons
+
+        Args:
+            temp_table_name: Name of the temporary table
+            target_table_name: Name of the target table
+            schema: Database schema name (default: "public")
+
+        Returns:
+            Tuple of (success: bool, affected_rows: int)
+
+        Raises:
+            ValueError: If no constraints are found for conflict resolution
+            Exception: If MERGE operation fails for any reason
+        """
+        try:
+            # Get table metadata and constraints
+            metadata = MetaData()
+            target_table = Table(target_table_name, metadata, autoload_with=self.engine, schema=schema)
+            all_columns = [col.name for col in target_table.columns]
+
+            pk_cols, uniques = self._get_constraints(target_table_name, schema)
+
+            if not pk_cols and not uniques:
+                raise ValueError("No constraints found - No conflict resolution to perform")
+
+            # Build all constraints list for dynamic processing
+            all_constraints = [pk_cols] if pk_cols else []
+            all_constraints.extend(uniques)
+
+            # Build constraint join conditions dynamically
+            constraint_conditions = []
+            for constraint_cols in all_constraints:
+                if len(constraint_cols) == 1:
+                    # Single column constraint: t.col = target.col
+                    col = constraint_cols[0]
+                    constraint_conditions.append(f'temp."{col}" = target."{col}"')
+                else:
+                    # Multi-column constraint: (t.col1 = target.col1 AND t.col2 = target.col2)
+                    multi_conditions = []
+                    for col in constraint_cols:
+                        multi_conditions.append(f'temp."{col}" = target."{col}"')
+                    constraint_conditions.append(f"({' AND '.join(multi_conditions)})")
+
+            # Combine all constraint conditions with OR
+            join_on_clause = " OR ".join(constraint_conditions)
+
+            # Build GROUP BY clause for all temp table columns
+            group_by_columns = ", ".join([f'temp."{col}"' for col in all_columns])
+            group_by_ctid_and_columns = "temp.ctid, " + group_by_columns
+
+            # Build ORDER BY clause for deterministic row ranking
+            order_by_columns = ", ".join([f'"{col}"' for col in all_columns])  # noqa
+
+            # Build SELECT clause for clean rows
+            select_columns = ", ".join([f'"{col}"' for col in all_columns])
+
+            # Build UPDATE SET clause (exclude PK columns to avoid conflicts)
+            update_columns = [col for col in all_columns if col not in (pk_cols or [])]
+            if update_columns:
+                update_set_clause = ", ".join([f'"{col}" = src."{col}"' for col in update_columns])
+            else:
+                # If all columns are PK, create a dummy update
+                update_set_clause = f'"{all_columns[0]}" = src."{all_columns[0]}"'
+
+            # Build VALUES clause for INSERT
+            values_clause = ", ".join([f'src."{col}"' for col in all_columns])
+
+            # Determine partition column for deduplication (prefer PK, fallback to first column)
+            partition_col = pk_cols[0] if pk_cols else all_columns[0]
+
+            # Build comprehensive MERGE SQL with dynamic constraints
+            merge_sql = f"""
+                WITH temp_with_conflicts AS (
+                    SELECT temp.*, temp.ctid,
+                           COUNT(DISTINCT target."{partition_col}") AS conflict_targets,
+                           MAX(target."{partition_col}") AS conflicted_target_id
+                    FROM "{temp_table_name}" temp
+                    LEFT JOIN "{schema}"."{target_table_name}" target
+                      ON {join_on_clause}
+                    GROUP BY {group_by_ctid_and_columns}
+                ),
+
+                -- Filter rows conflicting with more than one target row
+                filtered AS (
+                    SELECT * FROM temp_with_conflicts
+                    WHERE conflict_targets <= 1
+                ),
+
+                -- Deduplicate by keeping the last row per conflicted target
+                ranked AS (
+                    SELECT *,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY COALESCE(conflicted_target_id, "{partition_col}")
+                               ORDER BY ctid DESC
+                           ) AS row_rank
+                    FROM filtered
+                ),
+
+                -- Final rows to upsert
+                clean_rows AS (
+                    SELECT {select_columns}
+                    FROM ranked
+                    WHERE row_rank = 1
                 )
-                break
 
-        if stmt is None:
-            logger.warning("No matching constraints found, performing plain INSERT (may fail on conflicts)")
-            stmt = insert_stmt
+                -- Execute the MERGE operation
+                MERGE INTO "{schema}"."{target_table_name}" AS tgt
+                USING clean_rows AS src
+                ON ({join_on_clause.replace('temp.', 'tgt.').replace('target.', 'src.')})
+                WHEN MATCHED THEN
+                    UPDATE SET {update_set_clause}
+                WHEN NOT MATCHED THEN
+                    INSERT ({select_columns})
+                    VALUES ({values_clause})
+            """
+            logger.debug(f"Generated MERGE SQL: {merge_sql}")
 
-        retries = 0
-        max_retries, backoff_factor = 3, 2
+            with self.engine.begin() as conn:
+                # Execute the MERGE operation
+                result = conn.execute(text(merge_sql))
+                affected_rows = result.rowcount
+                logger.debug(f"MERGE operation completed successfully, affected {affected_rows} rows")
 
-        while retries <= max_retries:
-            try:
-                with self.engine.begin() as conn:
-                    result = conn.execute(stmt)
-                    rows_affected = result.rowcount if hasattr(result, 'rowcount') else len(chunk)
-                    logger.debug(f"Chunk processed successfully, {rows_affected} rows affected")
-                return
-            except OperationalError as e:
-                retries += 1
-                wait_time = backoff_factor ** retries
-                logger.warning(f"Transient database error (attempt {retries}/{max_retries}): {e}. "
-                               f"Retrying in {wait_time}s...")
-                time.sleep(wait_time)
-            except Exception as e:
-                logger.error(f"Permanent error processing chunk: {e}")
-                raise
+            return True, affected_rows
 
-        error_msg = f"Max retries ({max_retries}) reached for chunk, operation failed"
-        logger.error(error_msg)
-        raise OperationalError(error_msg, None, None)
+        except Exception as e:
+            logger.error(f"Failed to execute MERGE operation: {e}")
+            raise
 
-    def upsert_dataframe(self, dataframe: pd.DataFrame, table_name: str, schema: str = "public",
-                         chunk_size: int = 10_000, max_workers: int = 4,
-                         remove_multi_conflict_rows: bool = True) -> bool:
+    def _cleanup_temp_table(self, temp_table_name: str, schema: str = "public") -> None:
         """
-        Upsert a pandas DataFrame into a PostgreSQL table with conflict resolution.
+        Clean up the temporary table.
+
+        Args:
+            temp_table_name: Name of the temporary table to drop
+            schema: Database schema name (default: "public")
+
+        Raises:
+            Exception: If cleanup operation fails (logged but not re-raised)
+        """
+        try:
+            with self.engine.begin() as conn:
+                conn.execute(text(f'DROP TABLE IF EXISTS "{schema}.{temp_table_name}"'))
+
+            logger.debug(f"Cleaned up temporary table: {schema}.{temp_table_name}")
+
+        except Exception as e:
+            logger.error(f"Failed to cleanup temporary table {schema}.{temp_table_name}: {e}")
+
+    def upsert_dataframe(self, dataframe: pd.DataFrame, table_name: str, schema: str = "public") -> Tuple[bool, int]:
+        """
+        Upsert a pandas DataFrame into a PostgreSQL table using temporary table approach.
 
         This method automatically handles:
-        - Primary key and unique constraint conflicts using PostgreSQL's ON CONFLICT clause
+        - Multiple constraint conflicts using temporary table + JOIN approach
         - NaN value conversion: All pandas NaN values are converted to PostgreSQL NULL
-        - Multi-threaded processing for large datasets
-        - Progress tracking with visual progress bars
+        - Efficient bulk operations without chunking
 
         Args:
             dataframe: Input DataFrame to upsert
             table_name: Target table name in the database
             schema: Database schema name (default: "public")
-            chunk_size: Number of rows per chunk for parallel processing
-            max_workers: Maximum number of worker threads
-            remove_multi_conflict_rows: Whether to remove rows with multiple conflicts
 
         Returns:
-            True if all chunks are processed successfully
+            Tuple of (success: bool, affected_rows: int) - success is always True if no exception
 
         Raises:
             ValueError: If table doesn't exist or other validation errors
-            OperationalError: For database connection or transient errors after retries
-            Exception: For any database errors during chunk processing (fails fast)
+            OperationalError: For database connection or transient errors
+            Exception: For any database errors during processing
         """
-        if dataframe.empty:
+        if dataframe.empty or dataframe is None:
             logger.warning("Received empty DataFrame. Skipping upsert.")
-            return True
+            return True, 0
 
         logger.info(f"Starting upsert operation for {len(dataframe)} rows into {schema}.{table_name}")
 
-        df = dataframe.copy()
-
+        # Validate target table exists
         inspector = inspect(self.engine)
-
         if table_name not in inspector.get_table_names(schema=schema):
             error_msg = f"Destination table '{schema}.{table_name}' not found."
             logger.error(error_msg)
             raise ValueError(error_msg)
 
-        pk_cols, uniques = self._get_constraints(df, table_name, schema)
+        # Get constraints
+        pk_cols, uniques = self._get_constraints(table_name, schema)
 
-        if not uniques:
-            logger.warning(
-                f"No PK or UNIQUE constraints found on '{schema}.{table_name}'. Performing plain INSERT.")
-        else:
-            logger.info(f"Running multi-conflict removal with constraints: {uniques}")
-            df = self._remove_multi_conflict_rows(df, table_name, schema, max_workers=max_workers)
+        if not pk_cols and not uniques:
+            logger.info("No PK or UNIQUE constraints found, loading data using INSERT with no conflict resolution.")
 
-        if df.empty:
-            logger.warning("No rows remaining after conflict resolution. Operation completed.")
-            return True
+            df_clean = self._convert_nan_to_none(dataframe)
+            records = df_clean.to_dict('records')
 
-        logger.info(f"Upserting {len(df)} rows into {schema}.{table_name} in chunks of {chunk_size}...")
+            if not records:
+                logger.warning("No records to insert after NaN conversion")
+                return True, 0
 
-        # Progress bars: one for total rows, one for chunks
-        num_chunks = (len(df) + chunk_size - 1) // chunk_size
-        chunk_indices = [(i, min(i + chunk_size, len(df))) for i in range(0, len(df), chunk_size)]
+            metadata = MetaData()
+            target_table = Table(table_name, metadata, autoload_with=self.engine, schema=schema)
+            insert_stmt = insert(target_table).values(records)
+
+            with self.engine.begin() as conn:
+                result = conn.execute(insert_stmt)
+                affected_rows = result.rowcount
+            logger.info(f"INSERT operation completed successfully, affected {affected_rows} rows")
+
+            return True, affected_rows
+
+        logger.info(f"Found constraints: PK={pk_cols}, Uniques={uniques}")
+
+        temp_table_name = None
 
         try:
-            metadata = MetaData(schema=schema)
-            table = Table(table_name, metadata, autoload_with=self.engine)
+            with tqdm(total=6, desc="Processing upsert", unit="step") as pbar:
+                # Step 1: Create temporary table
+                temp_table_name = self._create_temp_table(dataframe, table_name, schema)
+                pbar.update(1)
+                pbar.set_description("Created temporary table")
+
+                # Step 2: Insert data into temp table
+                self._insert_into_temp_table(dataframe, temp_table_name)
+                pbar.update(1)
+                pbar.set_description("Inserted data to temp table")
+
+                # Step 3: Resolve conflicts using SQL
+                _, affected_rows = self._resolve_conflicts_with_temp_table(temp_table_name, table_name, schema)
+                pbar.update(4)
+                pbar.set_description("Completed successfully")
+
+            return True, affected_rows
+
         except Exception as e:
-            error_msg = f"Failed to load table '{schema}.{table_name}': {e}"
-            logger.error(error_msg)
-            raise ValueError(error_msg)
+            logger.error(f"Upsert operation failed: {e}")
+            raise
 
-        successful_chunks = 0
-        failed_chunks = 0
-
-        with tqdm(total=len(df), desc="Total rows upserted", unit="rows") as row_pbar:
-            with tqdm(total=num_chunks, desc="Upserting chunks", unit="chunk") as chunk_pbar:
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    futures = {}
-                    for start, end in chunk_indices:
-                        chunk = df.iloc[start:end]
-                        future = executor.submit(self._do_upsert, chunk, table, pk_cols, uniques)
-                        futures[future] = (start, end)
-
-                    for future in as_completed(futures):
-                        start, end = futures[future]
-                        chunk_size_actual = end - start
-                        if exc := future.exception():
-                            logger.error(f"Chunk {start}:{end} failed: {exc}")
-                            failed_chunks += 1
-                            # Raise the first encountered exception to fail fast
-                            raise exc
-                        else:
-                            logger.debug(f"Chunk {start}:{end} upserted successfully.")
-                            successful_chunks += 1
-                        row_pbar.update(chunk_size_actual)
-                        chunk_pbar.update(1)
-
-        logger.info(f"Upsert completed successfully. {successful_chunks} chunks processed.")
-        return True
+        finally:
+            # Always cleanup temp table if it exists
+            if temp_table_name:
+                self._cleanup_temp_table(temp_table_name)
