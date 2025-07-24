@@ -336,16 +336,26 @@ class PostgresqlUpsert:
             # Get table metadata and constraints
             metadata = MetaData()
             target_table = Table(target_table_name, metadata, autoload_with=self.engine, schema=schema)
-            all_columns = [col.name for col in target_table.columns]
+            temp_table = Table(temp_table_name, metadata, autoload_with=self.engine)
+
+            # Only use columns that exist in both temp and target tables
+            temp_columns = {col.name for col in temp_table.columns}
+            target_columns = {col.name for col in target_table.columns}
+            common_columns = list(temp_columns.intersection(target_columns))
+
+            logger.debug(f"Common columns between temp and target: {common_columns}")
 
             pk_cols, uniques = self._get_constraints(target_table_name, schema)
 
             if not pk_cols and not uniques:
                 raise ValueError("No constraints found - No conflict resolution to perform")
 
+            pk_cols_in_common = [col for col in (pk_cols or []) if col in common_columns]
+            uniques_in_common = [uc for uc in uniques if all(col in common_columns for col in uc)]
+
             # Build all constraints list for dynamic processing
-            all_constraints = [pk_cols] if pk_cols else []
-            all_constraints.extend(uniques)
+            all_constraints = [pk_cols_in_common] if pk_cols else []
+            all_constraints.extend(uniques_in_common)
 
             # Build constraint join conditions dynamically
             constraint_conditions = []
@@ -364,29 +374,29 @@ class PostgresqlUpsert:
             # Combine all constraint conditions with OR
             join_on_clause = " OR ".join(constraint_conditions)
 
-            # Build GROUP BY clause for all temp table columns
-            group_by_columns = ", ".join([f'temp."{col}"' for col in all_columns])
+            # Build GROUP BY clause
+            group_by_columns = ", ".join([f'temp."{col}"' for col in common_columns])
             group_by_ctid_and_columns = "temp.ctid, " + group_by_columns
 
             # Build ORDER BY clause for deterministic row ranking
-            order_by_columns = ", ".join([f'"{col}"' for col in all_columns])  # noqa
+            order_by_columns = ", ".join([f'"{col}"' for col in common_columns])  # noqa
 
             # Build SELECT clause for clean rows
-            select_columns = ", ".join([f'"{col}"' for col in all_columns])
+            select_columns = ", ".join([f'"{col}"' for col in common_columns])
 
             # Build UPDATE SET clause (exclude PK columns to avoid conflicts)
-            update_columns = [col for col in all_columns if col not in (pk_cols or [])]
+            update_columns = [col for col in common_columns if col not in pk_cols_in_common]
             if update_columns:
                 update_set_clause = ", ".join([f'"{col}" = src."{col}"' for col in update_columns])
             else:
-                # If all columns are PK, create a dummy update
-                update_set_clause = f'"{all_columns[0]}" = src."{all_columns[0]}"'
+                # If all common columns are PK, create a dummy update
+                update_set_clause = f'"{common_columns[0]}" = src."{common_columns[0]}"'
 
             # Build VALUES clause for INSERT
-            values_clause = ", ".join([f'src."{col}"' for col in all_columns])
+            values_clause = ", ".join([f'src."{col}"' for col in common_columns])
 
             # Determine partition column for deduplication (prefer PK, fallback to first column)
-            partition_col = pk_cols[0] if pk_cols else all_columns[0]
+            partition_col = pk_cols_in_common[0] if pk_cols_in_common else common_columns[0]
 
             # Build comprehensive MERGE SQL with dynamic constraints
             merge_sql = f"""
