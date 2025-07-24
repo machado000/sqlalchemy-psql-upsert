@@ -354,12 +354,14 @@ class PostgresqlUpsert:
             uniques_in_common = [uc for uc in uniques if all(col in common_columns for col in uc)]
 
             # Build all constraints list for dynamic processing
-            all_constraints = [pk_cols_in_common] if pk_cols else []
-            all_constraints.extend(uniques_in_common)
+            common_constraints = [pk_cols_in_common] if pk_cols_in_common else []
+            common_constraints.extend(uniques_in_common)
+            # Remove empty constraints
+            common_constraints = [constraint for constraint in common_constraints if constraint]
 
             # Build constraint join conditions dynamically
             constraint_conditions = []
-            for constraint_cols in all_constraints:
+            for constraint_cols in common_constraints:
                 if len(constraint_cols) == 1:
                     # Single column constraint: t.col = target.col
                     col = constraint_cols[0]
