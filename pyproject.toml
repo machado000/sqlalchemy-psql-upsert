@@ -1,6 +1,6 @@
 [project]
 name = "sqlalchemy-psql-upsert"
-version = "1.0.4"
+version = "1.1.0"
 description = "PostgreSQL upsert library with intelligent conflict resolution and multi-threaded processing"
 authors = [{name = "Joao Brito"}]
 readme = "README.md"
@@ -34,10 +34,10 @@ classifiers = [
     "Typing :: Typed"
 ]
 dependencies = [
+    "python-dotenv>=1.0.0",
     "pandas>=2.0.0",
     "pyarrow>=12.0.0",
     "psycopg2-binary>=2.9.0",
-    "python-dotenv>=1.0.0",
     "SQLAlchemy>=2.0.0", 
     "tqdm>=4.65.0",
 ]

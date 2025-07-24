@@ -1144,4 +1144,4 @@ dev = ["pytest", "testcontainers"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.9,<=3.13"
-content-hash = "ef3f65b9eefa8df6439ef549a3165e0eb19cc12505187e124fd18daea1047289"
+content-hash = "9b6afb6798afa74676e4f8b57e47bb42eb6a6206c05d84442a5deee8b6685fcb"
