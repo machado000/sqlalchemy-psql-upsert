@@ -48,13 +48,13 @@ dev = [
     "testcontainers[postgresql]>=4.0.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/machado000/sqlalchemy-psql-upsert"
+Issues = "https://github.com/machado000/sqlalchemy-psql-upsert/issues"
+
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
 packages = [{ include = "sqlalchemy_psql_upsert", from = "src" }]
-
-[project.urls]
-Homepage = "https://github.com/machado000/sqlalchemy-psql-upsert"
-Issues = "https://github.com/machado000/sqlalchemy-psql-upsert/issues"
