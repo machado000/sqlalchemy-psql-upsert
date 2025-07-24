@@ -8,14 +8,14 @@ import logging
 
 # Configure logging to show debug messages during tests
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(name)s - %(levelname)s - %(message)s',
     force=True  # Override any existing logging configuration
 )
 
 # Ensure the client logger shows debug messages
 logger = logging.getLogger('sqlalchemy_psql_upsert.client')
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 logger.propagate = True
 
 
@@ -40,7 +40,7 @@ def pg_engine():
 @pytest.fixture(scope="module")
 def upserter(pg_engine):
     # Initialize with debug=True to enable debug logging
-    return PostgresqlUpsert(engine=pg_engine, debug=True)
+    return PostgresqlUpsert(engine=pg_engine, debug=False)
 
 
 @pytest.fixture(scope="function")
