@@ -635,8 +635,8 @@ class PostgresqlUpsert:
             return_skipped: If True, returns DataFrame with skipped rows (default: False)
 
         Returns:
-            When return_skipped=False: int (affected_rows)
-            When return_skipped=True: Tuple[int, pd.DataFrame] (affected_rows, skipped_rows)
+            int: Number of affected rows in the target table
+            tuple[int, pd.DataFrame]: When return_skipped=True, returns (affected_rows, skipped_rows_df)
 
         Raises:
             ValueError: If table doesn't exist or other validation errors
