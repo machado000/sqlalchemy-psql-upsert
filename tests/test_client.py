@@ -119,20 +119,21 @@ def test_get_dataframe_constraints(upserter, test_df):
 def test_upsert_dataframe(upserter, populated_table, test_df):
     table_name = "target_table"
 
-    result, affected_rows = upserter.upsert_dataframe(test_df, table_name)
+    # Test with return_skipped=True (should return tuple)
+    count_affected_rows, skipped_rows = upserter.upsert_dataframe(test_df, table_name, return_skipped=True)
 
-    logger.info(f"Upsert result: {result}, Affected rows: {affected_rows}")
+    logger.info(f"Affected rows: {count_affected_rows}, Skipped rows: {len(skipped_rows)}")
 
-    with upserter.engine.connect() as conn:
-        result_df = pd.read_sql("SELECT * FROM target_table ORDER BY id", conn)
-        print(result_df)
+    assert count_affected_rows == 12 and len(skipped_rows) == 8
 
-    assert result is True
+    # Test with empty DataFrame and return_skipped=False (should return single integer)
+    empty_df = pd.DataFrame()
+    count_affected_rows = upserter.upsert_dataframe(empty_df, table_name, return_skipped=False)
 
-    # empty_df = pd.DataFrame()
+    logger.info(f"Empty DataFrame affected rows: {count_affected_rows}")
 
-    # result = upserter.upsert_dataframe(empty_df, table_name)
-    # assert result is True
+    assert count_affected_rows == 0
 
-    # with pytest.raises(Exception):
-    #     upserter.upsert_dataframe(test_df, "nonexistent_table")
+    # Test with nonexistent table
+    with pytest.raises(Exception):
+        upserter.upsert_dataframe(test_df, "nonexistent_table")
