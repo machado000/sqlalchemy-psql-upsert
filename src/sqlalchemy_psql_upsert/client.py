@@ -12,8 +12,9 @@ This module provides PostgreSQL upsert functionality with support for:
 import logging
 import pandas as pd
 import uuid
+
 from sqlalchemy import create_engine, inspect, text, insert
-from sqlalchemy import Engine, MetaData, Table, UniqueConstraint
+from sqlalchemy import Engine, MetaData, Table, UniqueConstraint, Column, Text
 from tqdm import tqdm
 from typing import List, Tuple, Optional
 from .config import PgConfig
@@ -218,10 +219,10 @@ class PostgresqlUpsert:
             logger.error(f"Failed to convert NaN values to None: {e}")
             raise
 
-    def _create_temp_table(self, dataframe: pd.DataFrame, target_table_name: str,
-                           schema: str = "public") -> str:
+    def _create_temp_tables(self, dataframe: pd.DataFrame, target_table_name: str,
+                            schema: str = "public") -> Tuple[str, str]:
         """
-        Create a temporary table with the same structure as the target table.
+        Create two TEMPORARY tables: one for raw data to upsert and one for clean rows after conflict resolution.
 
         Args:
             dataframe: DataFrame to determine column types
@@ -229,44 +230,52 @@ class PostgresqlUpsert:
             schema: Database schema name
 
         Returns:
-            Name of the created temporary table
+            Tuple of (raw_temp_table_name, clean_temp_table_name)
         """
-        # Generate unique temp table name
-        temp_table_name = f"temp_upsert_{uuid.uuid4().hex[:8]}"
+        # Generate unique temp table names
+        base_uuid = uuid.uuid4().hex[:8]
+        raw_table_name = f"temp_raw_{base_uuid}"
+        clean_table_name = f"temp_clean_{base_uuid}"
 
         try:
             # Get target table structure
-            metadata = MetaData()
-            target_table = Table(target_table_name, metadata, autoload_with=self.engine, schema=schema)
+            source_metadata = MetaData()
+            target_table = Table(target_table_name, source_metadata, autoload_with=self.engine, schema=schema)
 
-            # Create CREATE TABLE statement for temp table
-            columns_def = []
+            # Create new metadata for temp tables
+            temp_metadata = MetaData()
+
+            # Create new columns for temp tables (don't reuse existing Column objects)
+            raw_columns = []
+            clean_columns = []
+
             for col in target_table.columns:
                 if col.name in dataframe.columns:
-                    col_type = str(col.type.compile(dialect=self.engine.dialect))
-                    columns_def.append(f'"{col.name}" {col_type}')
+                    # Create new Column objects with same type but without constraints
+                    raw_columns.append(Column(col.name, col.type, nullable=True))
+                    clean_columns.append(Column(col.name, col.type, nullable=True))
 
-            columns_str = ", ".join(columns_def)
+            # Add skip_reason column only to raw table
+            skip_reason_col = Column('skip_reason', Text, nullable=True)
+            raw_columns.append(skip_reason_col)
 
-            create_temp_sql = f"""
-                CREATE TEMP TABLE "{temp_table_name}" (
-                    {columns_str}
-                )
-            """
+            # Create temp table definitions
+            raw_table = Table(raw_table_name, temp_metadata, *raw_columns, prefixes=['TEMPORARY'])
+            clean_table = Table(clean_table_name, temp_metadata, *clean_columns, prefixes=['TEMPORARY'])
 
-            with self.engine.begin() as conn:
-                conn.execute(text(create_temp_sql))
+            # Create both tables
+            temp_metadata.create_all(self.engine, tables=[raw_table, clean_table])
 
-            logger.debug(f"Created temporary table: {temp_table_name}")
-            return temp_table_name
+            logger.debug(f"Created temporary tables: {raw_table_name} (raw), {clean_table_name} (clean)")
+            return raw_table_name, clean_table_name
 
         except Exception as e:
-            logger.error(f"Failed to create temporary table: {e}")
+            logger.error(f"Failed to create temporary tables: {e}")
             raise
 
-    def _insert_into_temp_table(self, dataframe: pd.DataFrame, temp_table_name: str) -> Tuple[bool, int]:
+    def _populate_raw_temp_table(self, dataframe: pd.DataFrame, temp_table_name: str) -> Tuple[bool, int]:
         """
-        Insert all DataFrame data into the temporary table using SQLAlchemy.
+        Insert all DataFrame data into the temporary raw table using SQLAlchemy.
 
         Args:
             dataframe: DataFrame to insert
@@ -308,202 +317,337 @@ class PostgresqlUpsert:
             logger.error(f"Failed to insert data into temporary table {temp_table_name}: {e}")
             raise
 
-    def _resolve_conflicts_with_temp_table(self, temp_table_name: str, target_table_name: str,
-                                           schema: str = "public") -> Tuple[bool, int]:
+    def _populate_clean_temp_table(self, raw_table_name: str, clean_table_name: str,
+                                   target_table_name: str, schema: str = "public") -> int:
         """
-        Resolve conflicts between temporary table and target table using advanced MERGE with CTEs.
-
-        This method handles sophisticated upsert logic with comprehensive conflict resolution:
-        1. Analyze all conflicts across all constraints simultaneously
-        2. Filter out rows that conflict with multiple target rows (ambiguous)
-        3. Deduplicate temp rows that target the same existing row
-        4. Use PostgreSQL MERGE for atomic upsert operation
-        5. Track and log all skipped rows with reasons
+        Populate the clean temp table with conflict-resolved rows from raw temp table using a custom CTE.
+        Also updates skip_reason column for rows that are filtered out.
 
         Args:
-            temp_table_name: Name of the temporary table
+            raw_table_name: Name of the raw data temporary table
+            clean_table_name: Name of the clean rows temporary table
             target_table_name: Name of the target table
-            schema: Database schema name (default: "public")
+            schema: Database schema name
 
         Returns:
-            Tuple of (success: bool, affected_rows: int)
-
-        Raises:
-            ValueError: If no constraints are found for conflict resolution
-            Exception: If MERGE operation fails for any reason
+            Number of rows inserted into clean temp table
         """
         try:
             # Get table metadata and constraints
             metadata = MetaData()
             target_table = Table(target_table_name, metadata, autoload_with=self.engine, schema=schema)
-            temp_table = Table(temp_table_name, metadata, autoload_with=self.engine)
+            raw_table = Table(raw_table_name, metadata, autoload_with=self.engine)
 
-            # Only use columns that exist in both temp and target tables
-            temp_columns = {col.name for col in temp_table.columns}
+            # Get columns that exist in both target and raw tables
             target_columns = {col.name for col in target_table.columns}
-            common_columns = list(temp_columns.intersection(target_columns))
-
-            logger.debug(f"Common columns between temp and target: {common_columns}")
+            raw_columns = {col.name for col in raw_table.columns if col.name != 'skip_reason'}
+            common_columns = list(target_columns.intersection(raw_columns))
 
             pk_cols, uniques = self._get_constraints(target_table_name, schema)
 
-            if not pk_cols and not uniques:
-                raise ValueError("No constraints found - No conflict resolution to perform")
+            # Filter constraints to only include those with ALL columns present in raw table
+            usable_pk_cols = pk_cols if pk_cols and all(col in raw_columns for col in pk_cols) else []
+            usable_uniques = [uc for uc in uniques if all(col in raw_columns for col in uc)]
 
-            pk_cols_in_common = [col for col in (pk_cols or []) if col in common_columns]
-            uniques_in_common = [uc for uc in uniques if all(col in common_columns for col in uc)]
+            if not usable_pk_cols and not usable_uniques:
+                # No usable constraints, just copy all rows and mark them as accepted
+                select_columns = ", ".join([f'"{col}"' for col in common_columns])
 
-            # Build all constraints list for dynamic processing
-            common_constraints = [pk_cols_in_common] if pk_cols_in_common else []
-            common_constraints.extend(uniques_in_common)
-            # Remove empty constraints
-            common_constraints = [constraint for constraint in common_constraints if constraint]
+                # First, update all rows to mark them as accepted
+                update_sql = f"""
+                    UPDATE "{raw_table_name}"
+                    SET skip_reason = NULL
+                """
 
-            # Build constraint join conditions dynamically
-            constraint_conditions = []
-            for constraint_cols in common_constraints:
-                if len(constraint_cols) == 1:
-                    # Single column constraint: t.col = target.col
-                    col = constraint_cols[0]
-                    constraint_conditions.append(f'temp."{col}" = target."{col}"')
-                else:
-                    # Multi-column constraint: (t.col1 = target.col1 AND t.col2 = target.col2)
-                    multi_conditions = []
-                    for col in constraint_cols:
-                        multi_conditions.append(f'temp."{col}" = target."{col}"')
-                    constraint_conditions.append(f"({' AND '.join(multi_conditions)})")
+                # Then copy all rows to clean table
+                copy_sql = f"""
+                    INSERT INTO "{clean_table_name}" ({select_columns})
+                    SELECT {select_columns} FROM "{raw_table_name}"
+                """
 
-            # Combine all constraint conditions with OR
-            join_on_clause = " OR ".join(constraint_conditions)
+                with self.engine.begin() as conn:
+                    conn.execute(text(update_sql))
+                    result = conn.execute(text(copy_sql))
+                    clean_rows_count = result.rowcount
 
-            # Build GROUP BY clause
-            group_by_columns = ", ".join([f'temp."{col}"' for col in common_columns])
-            group_by_ctid_and_columns = "temp.ctid, " + group_by_columns
-
-            # Build ORDER BY clause for deterministic row ranking
-            order_by_columns = ", ".join([f'"{col}"' for col in common_columns])  # noqa
-
-            # Build SELECT clause for clean rows
-            select_columns = ", ".join([f'"{col}"' for col in common_columns])
-
-            # Build UPDATE SET clause (exclude PK columns to avoid conflicts)
-            update_columns = [col for col in common_columns if col not in pk_cols_in_common]
-            if update_columns:
-                update_set_clause = ", ".join([f'"{col}" = src."{col}"' for col in update_columns])
             else:
-                # If all common columns are PK, create a dummy update
-                update_set_clause = f'"{common_columns[0]}" = src."{common_columns[0]}"'
+                # Build constraint logic for conflict resolution with detailed skip reasons
+                usable_constraints = [usable_pk_cols] if usable_pk_cols else []
+                usable_constraints.extend(usable_uniques)
 
-            # Build VALUES clause for INSERT
-            values_clause = ", ".join([f'src."{col}"' for col in common_columns])
+                # Build constraint join conditions dynamically
+                constraint_conditions = []
+                for constraint_cols in usable_constraints:
+                    if len(constraint_cols) == 1:
+                        col = constraint_cols[0]
+                        constraint_conditions.append(f'raw."{col}" = target."{col}"')
+                    else:
+                        multi_conditions = []
+                        for col in constraint_cols:
+                            multi_conditions.append(f'raw."{col}" = target."{col}"')
+                        constraint_conditions.append(f"({' AND '.join(multi_conditions)})")
 
-            # Determine partition column for deduplication (prefer PK, fallback to first column)
-            partition_col = pk_cols_in_common[0] if pk_cols_in_common else common_columns[0]
+                join_on_clause = " OR ".join(constraint_conditions)
+                group_by_columns = ", ".join([f'raw."{col}"' for col in common_columns])
+                group_by_ctid_and_columns = "raw.ctid, " + group_by_columns
+                select_columns = ", ".join([f'"{col}"' for col in common_columns])
+                select_raw_columns = ", ".join([f'raw."{col}"' for col in common_columns])
+                partition_col = usable_pk_cols[0] if usable_pk_cols else common_columns[0]
 
-            # Build comprehensive MERGE SQL with dynamic constraints
-            merge_sql = f"""
-                WITH temp_with_conflicts AS (
-                    SELECT temp.*, temp.ctid,
-                           COUNT(DISTINCT target."{partition_col}") AS conflict_targets,
-                           MAX(target."{partition_col}") AS conflicted_target_id
-                    FROM "{temp_table_name}" temp
-                    LEFT JOIN "{schema}"."{target_table_name}" target
-                      ON {join_on_clause}
-                    GROUP BY {group_by_ctid_and_columns}
-                ),
+                # Enhanced CTE with detailed skip reason tracking
+                solve_conflicts_sql = f"""
+                    WITH raw_with_conflicts AS (
+                        SELECT {select_raw_columns}, raw.ctid,
+                               COUNT(DISTINCT target."{partition_col}") AS conflict_targets,
+                               MAX(target."{partition_col}") AS conflicted_target_id
+                        FROM "{raw_table_name}" raw
+                        LEFT JOIN "{schema}"."{target_table_name}" target
+                          ON {join_on_clause}
+                        GROUP BY {group_by_ctid_and_columns}
+                    ),
 
-                -- Filter rows conflicting with more than one target row
-                filtered AS (
-                    SELECT * FROM temp_with_conflicts
-                    WHERE conflict_targets <= 1
-                ),
+                    -- Filter rows conflicting with more than one target row
+                    filtered AS (
+                        SELECT *,
+                               CASE
+                                   WHEN conflict_targets > 1 THEN 'multiple_target_conflicts'
+                                   ELSE NULL
+                               END AS filter_reason
+                        FROM raw_with_conflicts
+                        WHERE conflict_targets <= 1
+                    ),
 
-                -- Deduplicate by keeping the last row per conflicted target
-                ranked AS (
-                    SELECT *,
-                           ROW_NUMBER() OVER (
-                               PARTITION BY COALESCE(conflicted_target_id, "{partition_col}")
-                               ORDER BY ctid DESC
-                           ) AS row_rank
-                    FROM filtered
-                ),
+                    -- Deduplicate by keeping the last row per conflicted target
+                    ranked AS (
+                        SELECT *,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY COALESCE(conflicted_target_id, "{partition_col}")
+                                   ORDER BY ctid DESC
+                               ) AS row_rank
+                        FROM filtered
+                    ),
 
-                -- Final rows to upsert
-                clean_rows AS (
+                    -- Identify rows to keep and update skip reasons
+                    final_selection AS (
+                        SELECT *,
+                               CASE
+                                   WHEN row_rank = 1 THEN NULL  -- Keep these rows
+                                   ELSE 'duplicate_source_rows'  -- Skip these rows
+                               END AS final_skip_reason
+                        FROM ranked
+                    )
+
+                    -- Update skip reasons for all rows first
+                    UPDATE "{raw_table_name}"
+                    SET skip_reason = COALESCE(
+                        (SELECT final_skip_reason FROM final_selection
+                         WHERE final_selection.ctid = "{raw_table_name}".ctid),
+                        (SELECT 'multiple_target_conflicts' FROM raw_with_conflicts
+                         WHERE raw_with_conflicts.ctid = "{raw_table_name}".ctid
+                         AND conflict_targets > 1)
+                    )
+                """
+
+                # Execute the update for skip reasons
+                with self.engine.begin() as conn:
+                    conn.execute(text(solve_conflicts_sql))
+
+                # Now insert clean rows
+                insert_clean_rows_sql = f"""
+                    INSERT INTO "{clean_table_name}" ({select_columns})
                     SELECT {select_columns}
-                    FROM ranked
-                    WHERE row_rank = 1
-                )
+                    FROM "{raw_table_name}"
+                    WHERE skip_reason IS NULL
+                """
 
-                -- Execute the MERGE operation
-                MERGE INTO "{schema}"."{target_table_name}" AS tgt
-                USING clean_rows AS src
-                ON ({join_on_clause.replace('temp.', 'tgt.').replace('target.', 'src.')})
-                WHEN MATCHED THEN
-                    UPDATE SET {update_set_clause}
-                WHEN NOT MATCHED THEN
-                    INSERT ({select_columns})
-                    VALUES ({values_clause})
+                with self.engine.begin() as conn:
+                    result = conn.execute(text(insert_clean_rows_sql))
+                    clean_rows_count = result.rowcount
+
+            logger.debug(f"Populated clean temp table with {clean_rows_count} rows")
+            return clean_rows_count
+
+        except Exception as e:
+            logger.error(f"Failed to populate clean temp table: {e}")
+            raise
+
+    def _get_skipped_rows(self, raw_table_name: str) -> pd.DataFrame:
+        """
+        Get rows that were skipped during conflict resolution with detailed skip reasons.
+
+        Args:
+            raw_table_name: Name of the raw data temporary table (with skip_reason column)
+
+        Returns:
+            DataFrame with skipped rows and their specific skip reasons.
+            Returns empty DataFrame if no rows were skipped.
+        """
+        try:
+            # Simply select all skipped rows with their reasons
+            skipped_sql = f"""
+                SELECT * FROM "{raw_table_name}"
+                WHERE skip_reason IS NOT NULL
             """
+
+            with self.engine.begin() as conn:
+                result = conn.execute(text(skipped_sql))
+                rows = result.fetchall()
+
+            if not rows:
+                # Return empty DataFrame with proper column structure
+                metadata = MetaData()
+                raw_table = Table(raw_table_name, metadata, autoload_with=self.engine)
+                columns = [col.name for col in raw_table.columns]
+                return pd.DataFrame(columns=columns)
+
+            # Convert to DataFrame with column names from result
+            skipped_df = pd.DataFrame(rows, columns=result.keys())
+
+            logger.debug(f"Found {len(skipped_df)} skipped rows with detailed reasons")
+            return skipped_df
+
+        except Exception as e:
+            logger.error(f"Failed to retrieve skipped rows: {e}")
+            return None
+
+    def _merge_from_clean_temp_table(self, clean_table_name: str, target_table_name: str,
+                                     schema: str = "public") -> int:
+        """
+        Execute MERGE operation from clean temp table to target table.
+
+        Args:
+            clean_table_name: Name of the clean rows temporary table
+            target_table_name: Name of the target table
+            schema: Database schema name
+
+        Returns:
+            Number of affected rows
+        """
+        try:
+            # Get table metadata and constraints
+            metadata = MetaData()
+            target_table = Table(target_table_name, metadata, autoload_with=self.engine, schema=schema)
+            clean_table = Table(clean_table_name, metadata, autoload_with=self.engine)
+
+            # Get columns that exist in both target and clean tables
+            target_columns = {col.name for col in target_table.columns}
+            clean_columns = {col.name for col in clean_table.columns}
+            common_columns = list(target_columns.intersection(clean_columns))
+
+            pk_cols, uniques = self._get_constraints(target_table_name, schema)
+
+            # Filter constraints to only include those with ALL columns present in clean table
+            usable_pk_cols = pk_cols if pk_cols and all(col in common_columns for col in pk_cols) else []
+            usable_uniques = [uc for uc in uniques if all(col in common_columns for col in uc)]
+
+            if not usable_pk_cols and not usable_uniques:
+                # No usable constraints, just INSERT
+                select_columns = ", ".join([f'"{col}"' for col in common_columns])
+                merge_sql = f"""
+                    INSERT INTO "{schema}"."{target_table_name}" ({select_columns})
+                    SELECT {select_columns} FROM "{clean_table_name}"
+                """
+            else:
+                # Build MERGE with usable constraints only
+                usable_constraints = [usable_pk_cols] if usable_pk_cols else []
+                usable_constraints.extend(usable_uniques)
+
+                constraint_conditions = []
+                for constraint_cols in usable_constraints:
+                    if len(constraint_cols) == 1:
+                        col = constraint_cols[0]
+                        constraint_conditions.append(f'tgt."{col}" = src."{col}"')
+                    else:
+                        multi_conditions = []
+                        for col in constraint_cols:
+                            multi_conditions.append(f'tgt."{col}" = src."{col}"')
+                        constraint_conditions.append(f"({' AND '.join(multi_conditions)})")
+
+                join_on_clause = " OR ".join(constraint_conditions)
+                select_columns = ", ".join([f'"{col}"' for col in common_columns])
+
+                # Build UPDATE SET clause (exclude PK columns that are usable)
+                update_columns = [col for col in common_columns if col not in (usable_pk_cols or [])]
+                if update_columns:
+                    update_set_clause = ", ".join([f'"{col}" = src."{col}"' for col in update_columns])
+                else:
+                    # If all common columns are PK, create a dummy update
+                    update_set_clause = f'"{common_columns[0]}" = src."{common_columns[0]}"'
+
+                values_clause = ", ".join([f'src."{col}"' for col in common_columns])
+
+                merge_sql = f"""
+                    MERGE INTO "{schema}"."{target_table_name}" AS tgt
+                    USING "{clean_table_name}" AS src
+                    ON ({join_on_clause})
+                    WHEN MATCHED THEN
+                        UPDATE SET {update_set_clause}
+                    WHEN NOT MATCHED THEN
+                        INSERT ({select_columns})
+                        VALUES ({values_clause})
+                """
+
             logger.debug(f"Generated MERGE SQL: {merge_sql}")
 
             with self.engine.begin() as conn:
-                # Execute the MERGE operation
                 result = conn.execute(text(merge_sql))
                 affected_rows = result.rowcount
-                logger.debug(f"MERGE operation completed successfully, affected {affected_rows} rows")
 
-            return True, affected_rows
+            logger.debug(f"MERGE operation completed successfully, affected {affected_rows} rows")
+            return affected_rows
 
         except Exception as e:
             logger.error(f"Failed to execute MERGE operation: {e}")
             raise
 
-    def _cleanup_temp_table(self, temp_table_name: str, schema: str = "public") -> None:
+    def _cleanup_temp_tables(self, *temp_table_names: str) -> None:
         """
-        Clean up the temporary table.
+        Clean up multiple temporary tables.
 
         Args:
-            temp_table_name: Name of the temporary table to drop
-            schema: Database schema name (default: "public")
-
-        Raises:
-            Exception: If cleanup operation fails (logged but not re-raised)
+            temp_table_names: Variable number of temporary table names to drop
         """
         try:
             with self.engine.begin() as conn:
-                conn.execute(text(f'DROP TABLE IF EXISTS "{schema}.{temp_table_name}"'))
-
-            logger.debug(f"Cleaned up temporary table: {schema}.{temp_table_name}")
+                for temp_table_name in temp_table_names:
+                    if temp_table_name:  # Only drop if name is not None/empty
+                        conn.execute(text(f'DROP TABLE IF EXISTS "{temp_table_name}"'))
+                        logger.debug(f"Cleaned up temporary table: {temp_table_name}")
 
         except Exception as e:
-            logger.error(f"Failed to cleanup temporary table {schema}.{temp_table_name}: {e}")
+            logger.error(f"Failed to cleanup temporary tables: {e}")
 
-    def upsert_dataframe(self, dataframe: pd.DataFrame, table_name: str, schema: str = "public") -> Tuple[bool, int]:
+    def upsert_dataframe(self, dataframe: pd.DataFrame, table_name: str, schema: str = "public",
+                         return_skipped: bool = False):
         """
-        Upsert a pandas DataFrame into a PostgreSQL table using temporary table approach.
+        Upsert a pandas DataFrame into a PostgreSQL table using dual temporary table approach.
 
         This method automatically handles:
-        - Multiple constraint conflicts using temporary table + JOIN approach
+        - Multiple constraint conflicts using temporary table approach
         - NaN value conversion: All pandas NaN values are converted to PostgreSQL NULL
-        - Efficient bulk operations without chunking
+        - Efficient bulk operations with conflict resolution
+        - Optional return of skipped rows for analysis
 
         Args:
             dataframe: Input DataFrame to upsert
             table_name: Target table name in the database
             schema: Database schema name (default: "public")
+            return_skipped: If True, returns DataFrame with skipped rows (default: False)
 
         Returns:
-            Tuple of (success: bool, affected_rows: int) - success is always True if no exception
+            When return_skipped=False: int (affected_rows)
+            When return_skipped=True: Tuple[int, pd.DataFrame] (affected_rows, skipped_rows)
 
         Raises:
             ValueError: If table doesn't exist or other validation errors
             OperationalError: For database connection or transient errors
             Exception: For any database errors during processing
         """
+        skipped_df = pd.DataFrame()
+
         if dataframe.empty or dataframe is None:
             logger.warning("Received empty DataFrame. Skipping upsert.")
-            return True, 0
+            return (0, skipped_df) if return_skipped else 0
 
         logger.info(f"Starting upsert operation for {len(dataframe)} rows into {schema}.{table_name}")
 
@@ -525,7 +669,7 @@ class PostgresqlUpsert:
 
             if not records:
                 logger.warning("No records to insert after NaN conversion")
-                return True, 0
+                return (0, skipped_df) if return_skipped else 0
 
             metadata = MetaData()
             target_table = Table(table_name, metadata, autoload_with=self.engine, schema=schema)
@@ -536,36 +680,56 @@ class PostgresqlUpsert:
                 affected_rows = result.rowcount
             logger.info(f"INSERT operation completed successfully, affected {affected_rows} rows")
 
-            return True, affected_rows
+            return (affected_rows, skipped_df) if return_skipped else affected_rows
 
         logger.info(f"Found constraints: PK={pk_cols}, Uniques={uniques}")
 
-        temp_table_name = None
+        raw_table_name = None
+        clean_table_name = None
 
         try:
             with tqdm(total=6, desc="Processing upsert", unit="step") as pbar:
-                # Step 1: Create temporary table
-                temp_table_name = self._create_temp_table(dataframe, table_name, schema)
+                # Step 1: Create both temporary tables
+                raw_table_name, clean_table_name = self._create_temp_tables(dataframe, table_name, schema)
                 pbar.update(1)
-                pbar.set_description("Created temporary table")
+                pbar.set_description("Created temporary tables")
 
-                # Step 2: Insert data into temp table
-                self._insert_into_temp_table(dataframe, temp_table_name)
+                # Step 2: Insert data into raw temp table
+                self._populate_raw_temp_table(dataframe, raw_table_name)
                 pbar.update(1)
-                pbar.set_description("Inserted data to temp table")
+                pbar.set_description("Loaded raw data")
 
-                # Step 3: Resolve conflicts using SQL
-                _, affected_rows = self._resolve_conflicts_with_temp_table(temp_table_name, table_name, schema)
-                pbar.update(4)
+                # Step 3: Populate clean temp table with conflict resolution
+                clean_rows_count = self._populate_clean_temp_table(raw_table_name, clean_table_name, table_name, schema)
+                pbar.update(1)
+                pbar.set_description("Resolved conflicts")
+
+                # Step 4: Get skipped rows if requested
+                if return_skipped:
+                    skipped_df = self._get_skipped_rows(raw_table_name)
+                    pbar.update(1)
+                    pbar.set_description("Analyzed skipped rows")
+                else:
+                    pbar.update(1)
+
+                # Step 5: Execute MERGE operation
+                affected_rows = self._merge_from_clean_temp_table(clean_table_name, table_name, schema)
+                pbar.update(1)
+                pbar.set_description("Executed MERGE")
+
+                pbar.update(1)
                 pbar.set_description("Completed successfully")
 
-            return True, affected_rows
+            logger.info(f"Upsert completed: {affected_rows} rows affected, "
+                        f"{len(dataframe) - clean_rows_count} rows skipped")
+
+            return (affected_rows, skipped_df) if return_skipped else affected_rows
 
         except Exception as e:
             logger.error(f"Upsert operation failed: {e}")
             raise
 
         finally:
-            # Always cleanup temp table if it exists
-            if temp_table_name:
-                self._cleanup_temp_table(temp_table_name)
+            # Always cleanup temp tables if they exist
+            if raw_table_name or clean_table_name:
+                self._cleanup_temp_tables(raw_table_name, clean_table_name)
