@@ -342,6 +342,7 @@ class PostgresqlUpsert:
             target_columns = {col.name for col in target_table.columns}
             raw_columns = {col.name for col in raw_table.columns if col.name != 'skip_reason'}
             common_columns = list(target_columns.intersection(raw_columns))
+            select_common_columns = ", ".join([f'"{col}"' for col in common_columns])
 
             pk_cols, uniques = self._get_constraints(target_table_name, schema)
 
@@ -351,8 +352,6 @@ class PostgresqlUpsert:
 
             if not usable_pk_cols and not usable_uniques:
                 # No usable constraints, just copy all rows and mark them as accepted
-                select_columns = ", ".join([f'"{col}"' for col in common_columns])
-
                 # First, update all rows to mark them as accepted
                 update_sql = f"""
                     UPDATE "{raw_table_name}"
@@ -361,8 +360,8 @@ class PostgresqlUpsert:
 
                 # Then copy all rows to clean table
                 copy_sql = f"""
-                    INSERT INTO "{clean_table_name}" ({select_columns})
-                    SELECT {select_columns} FROM "{raw_table_name}"
+                    INSERT INTO "{clean_table_name}" ({select_common_columns})
+                    SELECT {select_common_columns} FROM "{raw_table_name}"
                 """
 
                 with self.engine.begin() as conn:
@@ -387,23 +386,20 @@ class PostgresqlUpsert:
                             multi_conditions.append(f'raw."{col}" = target."{col}"')
                         constraint_conditions.append(f"({' AND '.join(multi_conditions)})")
 
-                join_on_clause = " OR ".join(constraint_conditions)
-                group_by_columns = ", ".join([f'raw."{col}"' for col in common_columns])
-                group_by_ctid_and_columns = "raw.ctid, " + group_by_columns
-                select_columns = ", ".join([f'"{col}"' for col in common_columns])
                 select_raw_columns = ", ".join([f'raw."{col}"' for col in common_columns])
-                partition_col = usable_pk_cols[0] if usable_pk_cols else common_columns[0]
+                join_on_clause = " OR ".join(constraint_conditions)
+                group_by_raw_columns = ", ".join([f'raw."{col}"' for col in common_columns])
 
                 # Enhanced CTE with detailed skip reason tracking
                 solve_conflicts_sql = f"""
                     WITH raw_with_conflicts AS (
-                        SELECT {select_raw_columns}, raw.ctid,
-                               COUNT(DISTINCT target."{partition_col}") AS conflict_targets,
-                               MAX(target."{partition_col}") AS conflicted_target_id
+                        SELECT raw.ctid, {select_raw_columns},
+                               COUNT(DISTINCT target."ctid") AS conflict_targets,
+                               MAX(target."ctid") AS conflicted_target_id
                         FROM "{raw_table_name}" raw
                         LEFT JOIN "{schema}"."{target_table_name}" target
                           ON {join_on_clause}
-                        GROUP BY {group_by_ctid_and_columns}
+                        GROUP BY raw.ctid, {group_by_raw_columns}
                     ),
 
                     -- Filter rows conflicting with more than one target row
@@ -421,7 +417,7 @@ class PostgresqlUpsert:
                     ranked AS (
                         SELECT *,
                                ROW_NUMBER() OVER (
-                                   PARTITION BY COALESCE(conflicted_target_id, "{partition_col}")
+                                   PARTITION BY COALESCE(conflicted_target_id, "ctid")
                                    ORDER BY ctid DESC
                                ) AS row_rank
                         FROM filtered
@@ -440,13 +436,15 @@ class PostgresqlUpsert:
                     -- Update skip reasons for all rows first
                     UPDATE "{raw_table_name}"
                     SET skip_reason = COALESCE(
-                        (SELECT final_skip_reason FROM final_selection
-                         WHERE final_selection.ctid = "{raw_table_name}".ctid),
                         (SELECT 'multiple_target_conflicts' FROM raw_with_conflicts
                          WHERE raw_with_conflicts.ctid = "{raw_table_name}".ctid
-                         AND conflict_targets > 1)
+                         AND conflict_targets > 1),
+                        (SELECT final_skip_reason FROM final_selection
+                         WHERE final_selection.ctid = "{raw_table_name}".ctid)
                     )
                 """
+
+                logger.debug(f"Generated UPDATE SQL: {solve_conflicts_sql}")
 
                 # Execute the update for skip reasons
                 with self.engine.begin() as conn:
@@ -454,8 +452,8 @@ class PostgresqlUpsert:
 
                 # Now insert clean rows
                 insert_clean_rows_sql = f"""
-                    INSERT INTO "{clean_table_name}" ({select_columns})
-                    SELECT {select_columns}
+                    INSERT INTO "{clean_table_name}" ({select_common_columns})
+                    SELECT {select_common_columns}
                     FROM "{raw_table_name}"
                     WHERE skip_reason IS NULL
                 """
@@ -533,6 +531,7 @@ class PostgresqlUpsert:
             target_columns = {col.name for col in target_table.columns}
             clean_columns = {col.name for col in clean_table.columns}
             common_columns = list(target_columns.intersection(clean_columns))
+            select_common_columns = ", ".join([f'"{col}"' for col in common_columns])
 
             pk_cols, uniques = self._get_constraints(target_table_name, schema)
 
@@ -542,10 +541,9 @@ class PostgresqlUpsert:
 
             if not usable_pk_cols and not usable_uniques:
                 # No usable constraints, just INSERT
-                select_columns = ", ".join([f'"{col}"' for col in common_columns])
                 merge_sql = f"""
-                    INSERT INTO "{schema}"."{target_table_name}" ({select_columns})
-                    SELECT {select_columns} FROM "{clean_table_name}"
+                    INSERT INTO "{schema}"."{target_table_name}" ({select_common_columns})
+                    SELECT {select_common_columns} FROM "{clean_table_name}"
                 """
             else:
                 # Build MERGE with usable constraints only
@@ -564,7 +562,6 @@ class PostgresqlUpsert:
                         constraint_conditions.append(f"({' AND '.join(multi_conditions)})")
 
                 join_on_clause = " OR ".join(constraint_conditions)
-                select_columns = ", ".join([f'"{col}"' for col in common_columns])
 
                 # Build UPDATE SET clause (exclude PK columns that are usable)
                 update_columns = [col for col in common_columns if col not in (usable_pk_cols or [])]
@@ -583,7 +580,7 @@ class PostgresqlUpsert:
                     WHEN MATCHED THEN
                         UPDATE SET {update_set_clause}
                     WHEN NOT MATCHED THEN
-                        INSERT ({select_columns})
+                        INSERT ({select_common_columns})
                         VALUES ({values_clause})
                 """
 
