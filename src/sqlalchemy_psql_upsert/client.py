@@ -1,12 +1,26 @@
 """
-client.py - PostgreSQL upsert client implementation with temporary table approach.
+PostgreSQL upsert client implementation with temporary table approach.
 
 This module provides PostgreSQL upsert functionality with support for:
 - Temporary table + JOIN based conflict resolution
-- Comprehensive constraint handling (PK, UNIQUE)
+- Comprehensive constraint handling (Primary Key, UNIQUE constraints)
 - Automatic NaN to NULL conversion for pandas DataFrames
 - Efficient bulk operations using SQLAlchemy
 - Progress tracking with tqdm
+- Detailed skip reason tracking for debugging
+
+The main class `PostgresqlUpsert` implements a dual temporary table approach:
+1. Raw temp table: Stores all input data with skip_reason tracking
+2. Clean temp table: Contains conflict-resolved data ready for merge
+
+This approach handles complex scenarios including:
+- Multiple unique constraints on the same table
+- Rows that conflict with multiple target records
+- Duplicate rows in the source data
+- Missing constraint columns in the DataFrame
+
+Type hints are provided for all public and private methods following
+PEP 484 standards.
 """
 
 import logging
@@ -16,7 +30,7 @@ import uuid
 from sqlalchemy import create_engine, inspect, text, insert
 from sqlalchemy import Engine, MetaData, Table, UniqueConstraint, Column, Text
 from tqdm import tqdm
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Union
 from .config import PgConfig
 
 logger = logging.getLogger(__name__)
@@ -25,7 +39,7 @@ logger.propagate = True
 
 class PostgresqlUpsert:
     """
-    PostgreSQL upsert utility class with support for conflict resolution and multi-threading.
+    PostgreSQL upsert utility class with support for conflict resolution.
 
     This class provides methods to upsert pandas DataFrames into PostgreSQL tables with
     automatic handling of primary key and unique constraint conflicts using a temporary
@@ -33,7 +47,7 @@ class PostgresqlUpsert:
     converted to PostgreSQL NULL values.
     """
 
-    def __init__(self, config: Optional['PgConfig'] = None, engine: Optional[Engine] = None,
+    def __init__(self, config: Optional[PgConfig] = None, engine: Optional[Engine] = None,
                  debug: bool = False) -> None:
         """
         Initialize PostgreSQL upsert client.
@@ -63,7 +77,12 @@ class PostgresqlUpsert:
         self._verify_temp_table_privileges()
 
     def create_engine(self) -> Engine:
-        """Create a new SQLAlchemy engine using default configuration."""
+        """
+        Create a new SQLAlchemy engine using default configuration.
+
+        Returns:
+            SQLAlchemy Engine instance configured with default PostgreSQL settings.
+        """
         uri = PgConfig().uri()
         logger.debug(f"Creating new database engine with URI: {uri}")
         return create_engine(uri)
@@ -154,6 +173,19 @@ class PostgresqlUpsert:
         """
         Get constraints that are applicable to the given DataFrame.
         Only returns constraints where ALL required columns are present in DataFrame.
+
+        Args:
+            dataframe: Input DataFrame to analyze for constraint compatibility
+            table_name: Name of the target table
+            schema: Database schema name (default: "public")
+
+        Returns:
+            Tuple of (primary_key_columns, list_of_unique_constraint_columns)
+            where each constraint list only includes constraints with all columns
+            present in the DataFrame.
+
+        Raises:
+            Exception: If constraint retrieval from the database fails
         """
         if dataframe.empty:
             logger.warning("Received empty DataFrame for constraint analysis, returning empty constraints")
@@ -183,40 +215,6 @@ class PostgresqlUpsert:
 
         except Exception as e:
             logger.error(f"Failed to retrieve constraints for dataframe: {str(e)}")
-            raise
-
-    def _convert_nan_to_none(self, dataframe: pd.DataFrame) -> pd.DataFrame:
-        """
-        Convert pandas DataFrame NaN values to None.
-
-        This method handles all pandas NaN variants including:
-        - numpy.nan (np.nan)
-        - pandas._libs.missing.NAType (pd.NA)
-        - Python None
-        - float('nan')
-
-        Args:
-            dataframe: DataFrame to convert
-
-        Returns:
-            DataFrame with NaN values converted to None (which becomes NULL in PostgreSQL)
-        """
-        if dataframe.empty or dataframe is None:
-            logger.warning("Received empty DataFrame. Skipping NaN conversion.")
-            return dataframe
-
-        try:
-            df = dataframe.copy()
-
-            # Replace all NaN variants with None
-            for col in df.columns:
-                df[col] = df[col].where(pd.notna(df[col]), None)
-
-            logger.debug(f"Converted NaN values to None for {len(df.columns)} columns")
-            return df
-
-        except Exception as e:
-            logger.error(f"Failed to convert NaN values to None: {e}")
             raise
 
     def _create_temp_tables(self, dataframe: pd.DataFrame, target_table_name: str,
@@ -288,11 +286,11 @@ class PostgresqlUpsert:
             Exception: If insertion fails for any reason
         """
         try:
-            # Convert NaN to None
-            df_clean = self._convert_nan_to_none(dataframe)
-
-            # Convert DataFrame to list of dictionaries
-            records = df_clean.to_dict('records')
+            # Convert DataFrame to list of dictionaries parsing pandas NaN to None
+            records = [
+                {k: (None if pd.isna(v) else v) for k, v in row.items()}
+                for row in dataframe.to_dict('records')
+            ]
 
             if not records:
                 logger.debug("No records to insert into temporary table")
@@ -469,7 +467,7 @@ class PostgresqlUpsert:
             logger.error(f"Failed to populate clean temp table: {e}")
             raise
 
-    def _get_skipped_rows(self, raw_table_name: str) -> pd.DataFrame:
+    def _get_skipped_rows(self, raw_table_name: str) -> Optional[pd.DataFrame]:
         """
         Get rows that were skipped during conflict resolution with detailed skip reasons.
 
@@ -479,6 +477,7 @@ class PostgresqlUpsert:
         Returns:
             DataFrame with skipped rows and their specific skip reasons.
             Returns empty DataFrame if no rows were skipped.
+            Returns None if an error occurs during retrieval.
         """
         try:
             # Simply select all skipped rows with their reasons
@@ -599,10 +598,16 @@ class PostgresqlUpsert:
 
     def _cleanup_temp_tables(self, *temp_table_names: str) -> None:
         """
-        Clean up multiple temporary tables.
+        Clean up multiple temporary tables by dropping them from the database.
 
         Args:
-            temp_table_names: Variable number of temporary table names to drop
+            temp_table_names: Variable number of temporary table names to drop.
+                            None or empty strings are safely ignored.
+
+        Note:
+            This method uses DROP TABLE IF EXISTS to avoid errors if tables
+            don't exist. Failures are logged but don't raise exceptions to
+            ensure cleanup attempts don't interrupt the main operation flow.
         """
         try:
             with self.engine.begin() as conn:
@@ -615,7 +620,7 @@ class PostgresqlUpsert:
             logger.error(f"Failed to cleanup temporary tables: {e}")
 
     def upsert_dataframe(self, dataframe: pd.DataFrame, table_name: str, schema: str = "public",
-                         return_skipped: bool = False):
+                         return_skipped: bool = False) -> Union[int, Tuple[int, pd.DataFrame]]:
         """
         Upsert a pandas DataFrame into a PostgreSQL table using dual temporary table approach.
 
@@ -637,8 +642,7 @@ class PostgresqlUpsert:
 
         Raises:
             ValueError: If table doesn't exist or other validation errors
-            OperationalError: For database connection or transient errors
-            Exception: For any database errors during processing
+            Exception: For database connection, transient, or processing errors
         """
         skipped_df = pd.DataFrame()
 
@@ -661,8 +665,11 @@ class PostgresqlUpsert:
         if not pk_cols and not uniques:
             logger.info("No PK or UNIQUE constraints found, loading data using INSERT with no conflict resolution.")
 
-            df_clean = self._convert_nan_to_none(dataframe)
-            records = df_clean.to_dict('records')
+            # Convert DataFrame to list of dictionaries parsing pandas NaN to None
+            records = [
+                {k: (None if pd.isna(v) else v) for k, v in row.items()}
+                for row in dataframe.to_dict('records')
+            ]
 
             if not records:
                 logger.warning("No records to insert after NaN conversion")
