@@ -120,11 +120,11 @@ def test_upsert_dataframe(upserter, populated_table, test_df):
     table_name = "target_table"
 
     # Test with return_skipped=True (should return tuple)
-    count_affected_rows, skipped_rows = upserter.upsert_dataframe(test_df, table_name, return_skipped=True)
+    count_affected_rows, skipped_rows_df = upserter.upsert_dataframe(test_df, table_name, return_skipped=True)
 
-    logger.info(f"Affected rows: {count_affected_rows}, Skipped rows: {len(skipped_rows)}")
+    logger.info(f"Affected rows: {count_affected_rows}, Skipped rows: {len(skipped_rows_df)}")
 
-    assert count_affected_rows == 12 and len(skipped_rows) == 8
+    assert count_affected_rows == 12 and len(skipped_rows_df) == 8
 
     # Test with empty DataFrame and return_skipped=False (should return single integer)
     empty_df = pd.DataFrame()
