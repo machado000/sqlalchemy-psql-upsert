@@ -271,52 +271,70 @@ class PostgresqlUpsert:
             logger.error(f"Failed to create temporary tables: {e}")
             raise
 
-    def _populate_raw_temp_table(self, dataframe: pd.DataFrame, temp_table_name: str) -> Tuple[bool, int]:
+    def _batch_insert_dataframe(self, dataframe: pd.DataFrame, table_name: str, schema: str = "public",
+                                batch_size: int = 5000) -> int:
         """
-        Insert all DataFrame data into the temporary raw table using SQLAlchemy.
+        Insert all DataFrame data into a table using SQLAlchemy with batched processing.
 
         Args:
             dataframe: DataFrame to insert
-            temp_table_name: Name of the temporary table
+            table_name: Name of the table
+            schema: Database schema name (default: "public", must be passed `None` for temporary tables)
+            batch_size: Number of rows to process per batch (default: 5000)
 
         Returns:
-            Tuple of (success: bool, affected_rows: int)
+            int: affected_rows
 
         Raises:
             Exception: If insertion fails for any reason
         """
+        if dataframe.empty:
+            logger.debug("No records to insert into temporary table")
+            return 0
+
         try:
-            # Convert DataFrame to list of dictionaries parsing pandas NaN to None
-            records = [
-                {k: (None if pd.isna(v) else v) for k, v in row.items()}
-                for row in dataframe.to_dict('records')
-            ]
-
-            if not records:
-                logger.debug("No records to insert into temporary table")
-                return True, 0
-
             # Get temp table metadata for SQLAlchemy insert
             metadata = MetaData()
-            temp_table = Table(temp_table_name, metadata, autoload_with=self.engine)
+            table = Table(table_name, metadata, autoload_with=self.engine, schema=schema)
 
-            # Use SQLAlchemy's insert construct for bulk insert
-            insert_stmt = insert(temp_table).values(records)
+            total_rows = len(dataframe)
+            total_affected_rows = 0
 
+            # Use single connection for all batches to reduce overhead
             with self.engine.begin() as conn:
-                result = conn.execute(insert_stmt)
-                affected_rows = result.rowcount
+                with tqdm(total=total_rows, desc="Inserting raw data", unit="rows") as pbar:
+                    for start_idx in range(0, total_rows, batch_size):
+                        end_idx = min(start_idx + batch_size, total_rows)
+                        batch_df = dataframe.iloc[start_idx:end_idx]
 
-            logger.debug(f"INSERT temporary table operation completed successfully, affected {affected_rows} rows")
+                        # Convert DataFrame batch to records with NaN to None conversion
+                        batch_records = [
+                            {k: (None if pd.isna(v) else v) for k, v in row.items()}
+                            for row in batch_df.to_dict('records')
+                        ]
 
-            return True, affected_rows
+                        # Execute batch insert
+                        insert_stmt = insert(table).values(batch_records)
+                        result = conn.execute(insert_stmt)
+                        batch_affected = result.rowcount
+                        total_affected_rows += batch_affected
+
+                        # Update progress
+                        pbar.update(len(batch_records))
+                        pbar.set_postfix({
+                            'batch': f"{start_idx//batch_size + 1}",
+                            'inserted': f"{total_affected_rows}"
+                        })
+
+            logger.info(f"INSERT on table '{table_name}' completed successfully, affected {total_affected_rows} rows")
+
+            return total_affected_rows
 
         except Exception as e:
-            logger.error(f"Failed to insert data into temporary table {temp_table_name}: {e}")
+            logger.error(f"Failed to insert data into temporary table {table_name}: {e}")
             raise
 
-    def _populate_clean_temp_table(self, raw_table_name: str, clean_table_name: str,
-                                   target_table_name: str, schema: str = "public") -> int:
+    def _solve_constraint_conflicts(self, raw_table_name: str, target_table_name: str, schema: str = "public") -> None:
         """
         Populate the clean temp table with conflict-resolved rows from raw temp table using a custom CTE.
         Also updates skip_reason column for rows that are filtered out.
@@ -334,13 +352,12 @@ class PostgresqlUpsert:
             # Get table metadata and constraints
             metadata = MetaData()
             target_table = Table(target_table_name, metadata, autoload_with=self.engine, schema=schema)
-            raw_table = Table(raw_table_name, metadata, autoload_with=self.engine)
+            raw_table = Table(raw_table_name, metadata, autoload_with=self.engine, schema=None)
 
             # Get columns that exist in both target and raw tables
             target_columns = {col.name for col in target_table.columns}
             raw_columns = {col.name for col in raw_table.columns if col.name != 'skip_reason'}
             common_columns = list(target_columns.intersection(raw_columns))
-            select_common_columns = ", ".join([f'"{col}"' for col in common_columns])
 
             pk_cols, uniques = self._get_constraints(target_table_name, schema)
 
@@ -356,16 +373,8 @@ class PostgresqlUpsert:
                     SET skip_reason = NULL
                 """
 
-                # Then copy all rows to clean table
-                copy_sql = f"""
-                    INSERT INTO "{clean_table_name}" ({select_common_columns})
-                    SELECT {select_common_columns} FROM "{raw_table_name}"
-                """
-
                 with self.engine.begin() as conn:
                     conn.execute(text(update_sql))
-                    result = conn.execute(text(copy_sql))
-                    clean_rows_count = result.rowcount
 
             else:
                 # Build constraint logic for conflict resolution with detailed skip reasons
@@ -448,19 +457,51 @@ class PostgresqlUpsert:
                 with self.engine.begin() as conn:
                     conn.execute(text(solve_conflicts_sql))
 
-                # Now insert clean rows
-                insert_clean_rows_sql = f"""
-                    INSERT INTO "{clean_table_name}" ({select_common_columns})
-                    SELECT {select_common_columns}
-                    FROM "{raw_table_name}"
-                    WHERE skip_reason IS NULL
-                """
+            logger.debug(f"Solved conflicts and updated table column '{raw_table_name}.skip_reason'")
 
-                with self.engine.begin() as conn:
-                    result = conn.execute(text(insert_clean_rows_sql))
-                    clean_rows_count = result.rowcount
+            return None
 
-            logger.debug(f"Populated clean temp table with {clean_rows_count} rows")
+        except Exception as e:
+            logger.error(f"Failed to solve conflicts: {e}")
+            raise
+
+    def _populate_clean_temp_table(self, raw_table_name: str, clean_table_name: str,) -> int:
+        """
+        Populate the temporary `clean_table` with conflict-resolved rows from
+        temporary `raw_table` where skip_reason is NULL.
+
+        Args:
+            raw_table_name: Name of the raw data temporary table
+            clean_table_name: Name of the clean rows temporary table
+
+        Returns:
+            Number of rows inserted into clean temp table
+        """
+        try:
+            # Get table metadata and constraints
+            metadata = MetaData()
+            raw_table = Table(raw_table_name, metadata, autoload_with=self.engine, schema=None)
+            clean_table = Table(clean_table_name, metadata, autoload_with=self.engine, schema=None)  # noqa
+
+            # Get columns that exist in both tables
+            raw_columns = {col.name for col in raw_table.columns if col.name != 'skip_reason'}
+            clean_columns = {col.name for col in clean_table.columns}
+            common_columns = list(raw_columns.intersection(clean_columns))
+            select_common_columns = ", ".join([f'"{col}"' for col in common_columns])
+
+            # Now insert clean rows
+            insert_clean_rows_sql = f"""
+                INSERT INTO "{clean_table_name}" ({select_common_columns})
+                SELECT {select_common_columns}
+                FROM "{raw_table_name}"
+                WHERE skip_reason IS NULL
+            """
+
+            with self.engine.begin() as conn:
+                result = conn.execute(text(insert_clean_rows_sql))
+                clean_rows_count = result.rowcount
+
+            logger.debug(f"Populated clean temp table '{clean_table_name}' with {clean_rows_count} rows")
             return clean_rows_count
 
         except Exception as e:
@@ -665,24 +706,7 @@ class PostgresqlUpsert:
         if not pk_cols and not uniques:
             logger.info("No PK or UNIQUE constraints found, loading data using INSERT with no conflict resolution.")
 
-            # Convert DataFrame to list of dictionaries parsing pandas NaN to None
-            records = [
-                {k: (None if pd.isna(v) else v) for k, v in row.items()}
-                for row in dataframe.to_dict('records')
-            ]
-
-            if not records:
-                logger.warning("No records to insert after NaN conversion")
-                return (0, skipped_df) if return_skipped else 0
-
-            metadata = MetaData()
-            target_table = Table(table_name, metadata, autoload_with=self.engine, schema=schema)
-            insert_stmt = insert(target_table).values(records)
-
-            with self.engine.begin() as conn:
-                result = conn.execute(insert_stmt)
-                affected_rows = result.rowcount
-            logger.info(f"INSERT operation completed successfully, affected {affected_rows} rows")
+            affected_rows = self._batch_insert_dataframe(dataframe, table_name, schema)
 
             return (affected_rows, skipped_df) if return_skipped else affected_rows
 
@@ -699,14 +723,19 @@ class PostgresqlUpsert:
                 pbar.set_description("Created temporary tables")
 
                 # Step 2: Insert data into raw temp table
-                self._populate_raw_temp_table(dataframe, raw_table_name)
+                self._batch_insert_dataframe(dataframe, raw_table_name, schema=None)
                 pbar.update(1)
                 pbar.set_description("Loaded raw data")
 
                 # Step 3: Populate clean temp table with conflict resolution
-                clean_rows_count = self._populate_clean_temp_table(raw_table_name, clean_table_name, table_name, schema)
+                self._solve_constraint_conflicts(raw_table_name, table_name, schema)
                 pbar.update(1)
                 pbar.set_description("Resolved conflicts")
+
+                # Step 3: Populate clean temp table with conflict resolution
+                clean_rows_count = self._populate_clean_temp_table(raw_table_name, clean_table_name)
+                pbar.update(1)
+                pbar.set_description("Populated clean temporary table")
 
                 # Step 4: Get skipped rows if requested
                 if return_skipped:
