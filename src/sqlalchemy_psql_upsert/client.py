@@ -31,7 +31,7 @@ import uuid
 from sqlalchemy import create_engine, inspect, text, insert
 from sqlalchemy import Engine, MetaData, Table, UniqueConstraint, Column, Text
 from tqdm import tqdm
-from typing import List, Tuple, Optional, Union, Any
+from typing import Optional, Union, Any
 from .config import PgConfig
 
 logger = logging.getLogger(__name__)
@@ -89,7 +89,7 @@ class PostgresqlUpsert:
         logger.debug(f"Creating new database engine with URI: {uri}")
         return create_engine(uri)
 
-    def _list_tables(self) -> List[str]:
+    def _list_tables(self) -> list[str]:
         """
         Get a list of all table names in the database.
 
@@ -132,7 +132,7 @@ class PostgresqlUpsert:
             logger.error(error_msg)
             raise PermissionError(error_msg) from e
 
-    def _get_constraints(self, table_name: str, schema: str = "public") -> Tuple[List[str], List[List[str]]]:
+    def _get_constraints(self, table_name: str, schema: str = "public") -> tuple[list[str], list[list[str]]]:
         """
         Get primary key and unique constraints for a table.
 
@@ -171,7 +171,7 @@ class PostgresqlUpsert:
             raise
 
     def _get_dataframe_constraints(self, dataframe: pd.DataFrame, table_name: str,
-                                   schema: str = "public") -> Tuple[List[str], List[List[str]]]:
+                                   schema: str = "public") -> tuple[list[str], list[list[str]]]:
         """
         Get constraints that are applicable to the given DataFrame.
         Only returns constraints where ALL required columns are present in DataFrame.
@@ -220,7 +220,7 @@ class PostgresqlUpsert:
             raise
 
     def _create_temp_tables(self, dataframe: pd.DataFrame, target_table_name: str,
-                            schema: str = "public") -> Tuple[str, str]:
+                            schema: str = "public") -> tuple[str, str]:
         """
         Create two TEMPORARY tables: one for raw data to upsert and one for clean rows after conflict resolution.
 
@@ -300,7 +300,7 @@ class PostgresqlUpsert:
 
         return False
 
-    def _batch_insert_dataframe(self, dataframe: pd.DataFrame, table_name: str, schema: str = "public",
+    def _batch_insert_dataframe(self, dataframe: pd.DataFrame, table_name: str, schema: Optional[str] = "public",
                                 batch_size: int = 5000) -> int:
         """
         Insert all DataFrame data into a table using SQLAlchemy with batched processing.
@@ -308,11 +308,11 @@ class PostgresqlUpsert:
         Args:
             dataframe: DataFrame to insert
             table_name: Name of the table
-            schema: Database schema name (default: "public", must be passed `None` for temporary tables)
+            schema: Database schema name (default: "public"). Pass None for temporary tables.
             batch_size: Number of rows to process per batch (default: 5000)
 
         Returns:
-            int: affected_rows
+            Number of rows that were successfully inserted
 
         Raises:
             Exception: If insertion fails for any reason
@@ -653,7 +653,7 @@ class PostgresqlUpsert:
             logger.error(f"Failed to execute MERGE operation: {e}")
             raise
 
-    def _cleanup_temp_tables(self, *temp_table_names: str) -> None:
+    def _cleanup_temp_tables(self, *temp_table_names: Optional[str]) -> None:
         """
         Clean up multiple temporary tables by dropping them from the database.
 
@@ -677,7 +677,7 @@ class PostgresqlUpsert:
             logger.error(f"Failed to cleanup temporary tables: {e}")
 
     def upsert_dataframe(self, dataframe: pd.DataFrame, table_name: str, schema: str = "public",
-                         return_skipped: bool = False) -> Union[int, Tuple[int, pd.DataFrame]]:
+                         return_skipped: bool = False) -> Union[int, tuple[int, pd.DataFrame]]:
         """
         Upsert a pandas DataFrame into a PostgreSQL table using dual temporary table approach.
 
