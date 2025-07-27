@@ -1,11 +1,11 @@
 [project]
 name = "sqlalchemy-psql-upsert"
-version = "1.1.1"
+version = "1.2.0"
 description = "PostgreSQL upsert library with intelligent conflict resolution and multi-threaded processing"
 authors = [{name = "Joao Brito"}]
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.9,<=3.13"
+requires-python = ">=3.10,<=3.13"
 keywords = [
     "postgresql", 
     "upsert", 
@@ -23,10 +23,10 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Database",
     "Topic :: Database :: Database Engines/Servers",
     "Topic :: Software Development :: Libraries :: Python Modules",
@@ -46,6 +46,7 @@ dependencies = [
 dev = [
     "pytest>=8.0.0",
     "testcontainers[postgresql]>=4.0.0",
+    "mypy>=1.17.0",
 ]
 
 [project.urls]
@@ -58,3 +59,31 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
 packages = [{ include = "sqlalchemy_psql_upsert", from = "src" }]
+
+[tool.poetry.group.dev.dependencies]
+mypy = "^1.17.0"
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+show_error_codes = true
+
+[[tool.mypy.overrides]]
+module = [
+    "pandas.*",
+    "tqdm.*",
+    "testcontainers.*",
+]
+ignore_missing_imports = true
+
