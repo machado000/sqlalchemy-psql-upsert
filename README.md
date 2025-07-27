@@ -4,6 +4,7 @@
 [![License](https://img.shields.io/github/license/machado000/sqlalchemy-psql-upsert)](https://github.com/machado000/sqlalchemy-psql-upsert/blob/main/LICENSE)
 [![Issues](https://img.shields.io/github/issues/machado000/sqlalchemy-psql-upsert)](https://github.com/machado000/sqlalchemy-psql-upsert/issues)
 [![Last Commit](https://img.shields.io/github/last-commit/machado000/sqlalchemy-psql-upsert)](https://github.com/machado000/sqlalchemy-psql-upsert/commits/main)
+[![CI](https://github.com/machado000/sqlalchemy-psql-upsert/actions/workflows/ci.yml/badge.svg)](https://github.com/machado000/sqlalchemy-psql-upsert/actions/workflows/ci.yml)
 
 
 A high-performance Python library for PostgreSQL UPSERT operations with intelligent conflict resolution using PostgreSQL temporary tables and atomic MERGE statements. Designed for reliability, data integrity, and modern Python development.
