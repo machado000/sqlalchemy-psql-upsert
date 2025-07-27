@@ -42,13 +42,6 @@ dependencies = [
     "tqdm>=4.65.0",
 ]
 
-[project.optional-dependencies]
-dev = [
-    "pytest>=8.0.0",
-    "testcontainers[postgresql]>=4.0.0",
-    "mypy>=1.17.0",
-]
-
 [project.urls]
 Homepage = "https://github.com/machado000/sqlalchemy-psql-upsert"
 Issues = "https://github.com/machado000/sqlalchemy-psql-upsert/issues"
@@ -61,6 +54,8 @@ build-backend = "poetry.core.masonry.api"
 packages = [{ include = "sqlalchemy_psql_upsert", from = "src" }]
 
 [tool.poetry.group.dev.dependencies]
+pytest = "^8.0.0"
+testcontainers = {extras = ["postgresql"], version = "^4.0.0"}
 mypy = "^1.17.0"
 
 [tool.mypy]
