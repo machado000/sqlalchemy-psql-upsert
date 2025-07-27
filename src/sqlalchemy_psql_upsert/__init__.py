@@ -7,7 +7,7 @@ advanced conflict resolution and multi-threaded processing.
 
 import logging
 from sqlalchemy import create_engine, text, Engine
-from typing import Optional, Tuple
+from typing import Optional
 from .client import PostgresqlUpsert
 from .config import PgConfig
 
@@ -41,7 +41,7 @@ def setup_logging(level: int = logging.INFO,
     )
 
 
-def test_connection(config: Optional[PgConfig] = None, engine: Optional[Engine] = None) -> Tuple[bool, str]:
+def test_connection(config: Optional[PgConfig] = None, engine: Optional[Engine] = None) -> tuple[bool, str]:
     """
     Test database connectivity using provided configuration or engine.
 
