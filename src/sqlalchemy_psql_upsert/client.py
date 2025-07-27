@@ -4,7 +4,8 @@ PostgreSQL upsert client implementation with temporary table approach.
 This module provides PostgreSQL upsert functionality with support for:
 - Temporary table + JOIN based conflict resolution
 - Comprehensive constraint handling (Primary Key, UNIQUE constraints)
-- Automatic NaN to NULL conversion for pandas DataFrames
+- Comprehensive NaN to NULL conversion for pandas DataFrames (handles pandas NaN,
+  string representations like "nan", "null", "none", and empty strings)
 - Efficient bulk operations using SQLAlchemy
 - Progress tracking with tqdm
 - Detailed skip reason tracking for debugging
@@ -30,7 +31,7 @@ import uuid
 from sqlalchemy import create_engine, inspect, text, insert
 from sqlalchemy import Engine, MetaData, Table, UniqueConstraint, Column, Text
 from tqdm import tqdm
-from typing import List, Tuple, Optional, Union
+from typing import List, Tuple, Optional, Union, Any
 from .config import PgConfig
 
 logger = logging.getLogger(__name__)
@@ -43,8 +44,9 @@ class PostgresqlUpsert:
 
     This class provides methods to upsert pandas DataFrames into PostgreSQL tables with
     automatic handling of primary key and unique constraint conflicts using a temporary
-    table approach. All pandas NaN values (np.nan, pd.NaType, None) are automatically
-    converted to PostgreSQL NULL values.
+    table approach. Comprehensive NaN value conversion: All pandas NaN values (np.nan,
+    pd.NaType, None) and string representations ("nan", "null", "none", empty strings)
+    are automatically converted to PostgreSQL NULL values.
     """
 
     def __init__(self, config: Optional[PgConfig] = None, engine: Optional[Engine] = None,
@@ -271,6 +273,33 @@ class PostgresqlUpsert:
             logger.error(f"Failed to create temporary tables: {e}")
             raise
 
+    def _is_nan_value(self, value: Any) -> bool:
+        """
+        Comprehensive NaN detection for various data types.
+
+        This function detects:
+        - pandas NaN, np.nan, None
+        - String representations: "nan", "NaN", "null", "NULL", "None"
+        - Empty strings and whitespace-only strings
+
+        Args:
+            value: Any value to check for NaN-like properties
+
+        Returns:
+            bool: True if value should be converted to SQL NULL, False otherwise
+        """
+        # Handle None and pandas/numpy NaN
+        if value is None or pd.isna(value):
+            return True
+
+        # Handle string representations of NaN/null
+        if isinstance(value, str):
+            cleaned_value = value.strip().lower()
+            if cleaned_value in ('nan', 'null', 'none', ''):
+                return True
+
+        return False
+
     def _batch_insert_dataframe(self, dataframe: pd.DataFrame, table_name: str, schema: str = "public",
                                 batch_size: int = 5000) -> int:
         """
@@ -302,14 +331,14 @@ class PostgresqlUpsert:
 
             # Use single connection for all batches to reduce overhead
             with self.engine.begin() as conn:
-                with tqdm(total=total_rows, desc="Inserting raw data", unit="rows") as pbar:
+                with tqdm(total=total_rows, desc=f"{"Inserting raw data":>25}", unit="rows") as pbar:
                     for start_idx in range(0, total_rows, batch_size):
                         end_idx = min(start_idx + batch_size, total_rows)
                         batch_df = dataframe.iloc[start_idx:end_idx]
 
-                        # Convert DataFrame batch to records with NaN to None conversion
+                        # Convert DataFrame batch to records with comprehensive NaN to None conversion
                         batch_records = [
-                            {k: (None if pd.isna(v) else v) for k, v in row.items()}
+                            {k: (None if self._is_nan_value(v) else v) for k, v in row.items()}
                             for row in batch_df.to_dict('records')
                         ]
 
@@ -369,7 +398,7 @@ class PostgresqlUpsert:
                     conn.execute(text(update_sql))
 
                 logger.debug(f"No constraints found, marked all rows as accepted in '{raw_table_name}'")
-                return None
+                return
 
             # Build constraint logic for conflict resolution
             usable_constraints = [usable_pk_cols] if usable_pk_cols else []
@@ -654,7 +683,8 @@ class PostgresqlUpsert:
 
         This method automatically handles:
         - Multiple constraint conflicts using temporary table approach
-        - NaN value conversion: All pandas NaN values are converted to PostgreSQL NULL
+        - Comprehensive NaN value conversion: All pandas NaN values and string representations
+          ("nan", "null", "none", empty strings) are converted to PostgreSQL NULL
         - Efficient bulk operations with conflict resolution
         - Optional return of skipped rows for analysis
 
@@ -707,38 +737,38 @@ class PostgresqlUpsert:
                 # Step 1: Create both temporary tables
                 raw_table_name, clean_table_name = self._create_temp_tables(dataframe, table_name, schema)
                 pbar.update(1)
-                pbar.set_description("Created temporary tables")
+                pbar.set_description(f"{"Created temporary tables":>25}")
 
                 # Step 2: Insert data into raw temp table
                 self._batch_insert_dataframe(dataframe, raw_table_name, schema=None)
                 pbar.update(1)
-                pbar.set_description("Loaded raw data")
+                pbar.set_description(f"{"Loaded raw data":>25}")
 
                 # Step 3: Populate clean temp table with conflict resolution
                 self._solve_constraint_conflicts(raw_table_name, table_name, schema)
                 pbar.update(1)
-                pbar.set_description("Resolved conflicts")
+                pbar.set_description(f"{"Resolved conflicts":>25}")
 
                 # Step 4: Populate clean temp table with conflict resolution
                 clean_rows_count = self._populate_clean_temp_table(raw_table_name, clean_table_name)
                 pbar.update(1)
-                pbar.set_description("Populated clean temporary table")
+                pbar.set_description(f"{"Populated clean table":>25}")
 
                 # Step 5: Get skipped rows if requested
                 if return_skipped:
                     skipped_df = self._get_skipped_rows(raw_table_name)
                     pbar.update(1)
-                    pbar.set_description("Analyzed skipped rows")
+                    pbar.set_description(f"{"Fetch skipped rows":>25}")
                 else:
                     pbar.update(1)
 
                 # Step 6: Execute MERGE operation
                 affected_rows = self._merge_from_clean_temp_table(clean_table_name, table_name, schema)
                 pbar.update(1)
-                pbar.set_description("Executed MERGE")
+                pbar.set_description(f"{"Executed MERGE":>25}")
 
                 pbar.update(1)
-                pbar.set_description("Completed successfully")
+                pbar.set_description(f"{"Completed successfully":>25}")
 
             logger.info(f"Upsert completed: {affected_rows} rows affected, "
                         f"{len(dataframe) - clean_rows_count} rows skipped")
