@@ -326,7 +326,7 @@ class PostgresqlUpsert:
                             'inserted': f"{total_affected_rows}"
                         })
 
-            logger.info(f"INSERT on table '{table_name}' completed successfully, affected {total_affected_rows} rows")
+            logger.debug(f"INSERT on table '{table_name}' completed successfully, affected {total_affected_rows} rows")
 
             return total_affected_rows
 
@@ -336,17 +336,13 @@ class PostgresqlUpsert:
 
     def _solve_constraint_conflicts(self, raw_table_name: str, target_table_name: str, schema: str = "public") -> None:
         """
-        Populate the clean temp table with conflict-resolved rows from raw temp table using a custom CTE.
-        Also updates skip_reason column for rows that are filtered out.
+        Resolve constraint conflicts by updating skip_reason column in raw table.
+        Uses optimized step-by-step approach for better performance on large datasets.
 
         Args:
             raw_table_name: Name of the raw data temporary table
-            clean_table_name: Name of the clean rows temporary table
             target_table_name: Name of the target table
             schema: Database schema name
-
-        Returns:
-            Number of rows inserted into clean temp table
         """
         try:
             # Get table metadata and constraints
@@ -366,100 +362,91 @@ class PostgresqlUpsert:
             usable_uniques = [uc for uc in uniques if all(col in raw_columns for col in uc)]
 
             if not usable_pk_cols and not usable_uniques:
-                # No usable constraints, just copy all rows and mark them as accepted
-                # First, update all rows to mark them as accepted
-                update_sql = f"""
-                    UPDATE "{raw_table_name}"
-                    SET skip_reason = NULL
-                """
+                # No usable constraints, just mark all rows as accepted
+                update_sql = f'UPDATE "{raw_table_name}" SET skip_reason = NULL'
 
                 with self.engine.begin() as conn:
                     conn.execute(text(update_sql))
 
-            else:
-                # Build constraint logic for conflict resolution with detailed skip reasons
-                usable_constraints = [usable_pk_cols] if usable_pk_cols else []
-                usable_constraints.extend(usable_uniques)
+                logger.debug(f"No constraints found, marked all rows as accepted in '{raw_table_name}'")
+                return None
 
-                # Build constraint join conditions dynamically
-                constraint_conditions = []
-                for constraint_cols in usable_constraints:
-                    if len(constraint_cols) == 1:
-                        col = constraint_cols[0]
-                        constraint_conditions.append(f'raw."{col}" = target."{col}"')
-                    else:
-                        multi_conditions = []
-                        for col in constraint_cols:
-                            multi_conditions.append(f'raw."{col}" = target."{col}"')
-                        constraint_conditions.append(f"({' AND '.join(multi_conditions)})")
+            # Build constraint logic for conflict resolution
+            usable_constraints = [usable_pk_cols] if usable_pk_cols else []
+            usable_constraints.extend(usable_uniques)
 
-                select_raw_columns = ", ".join([f'raw."{col}"' for col in common_columns])
-                join_on_clause = " OR ".join(constraint_conditions)
-                group_by_raw_columns = ", ".join([f'raw."{col}"' for col in common_columns])
+            # Build constraint join conditions dynamically
+            constraint_conditions = []
+            for constraint_cols in usable_constraints:
+                if len(constraint_cols) == 1:
+                    col = constraint_cols[0]
+                    constraint_conditions.append(f'raw."{col}" = target."{col}"')
+                else:
+                    multi_conditions = [f'raw."{col}" = target."{col}"' for col in constraint_cols]
+                    constraint_conditions.append(f"({' AND '.join(multi_conditions)})")
 
-                # Enhanced CTE with detailed skip reason tracking
-                solve_conflicts_sql = f"""
-                    WITH raw_with_conflicts AS (
-                        SELECT raw.ctid, {select_raw_columns},
-                               COUNT(DISTINCT target."ctid") AS conflict_targets,
-                               MAX(target."ctid") AS conflicted_target_id
-                        FROM "{raw_table_name}" raw
-                        LEFT JOIN "{schema}"."{target_table_name}" target
-                          ON {join_on_clause}
-                        GROUP BY raw.ctid, {group_by_raw_columns}
-                    ),
+            join_on_clause = " OR ".join(constraint_conditions)
+            select_raw_columns = ", ".join([f'raw."{col}"' for col in common_columns])
 
-                    -- Filter rows conflicting with more than one target row
-                    filtered AS (
-                        SELECT *,
-                               CASE
-                                   WHEN conflict_targets > 1 THEN 'multiple_target_conflicts'
-                                   ELSE NULL
-                               END AS filter_reason
-                        FROM raw_with_conflicts
-                        WHERE conflict_targets <= 1
-                    ),
+            with self.engine.begin() as conn:
+                # Step 1: Create temporary conflict analysis table for better performance
+                conflicts_table = f"temp_conflicts_{uuid.uuid4().hex[:8]}"
 
-                    -- Deduplicate by keeping the last row per conflicted target
-                    ranked AS (
-                        SELECT *,
-                               ROW_NUMBER() OVER (
-                                   PARTITION BY COALESCE(conflicted_target_id, "ctid")
-                                   ORDER BY ctid DESC
-                               ) AS row_rank
-                        FROM filtered
-                    ),
+                create_conflicts_sql = f"""
+                    CREATE TEMP TABLE "{conflicts_table}" AS
+                    SELECT raw.ctid as raw_ctid,
+                           {select_raw_columns},
+                           COUNT(DISTINCT target.ctid) AS conflict_count,
+                           MIN(target.ctid) AS target_ctid
+                    FROM "{raw_table_name}" raw
+                    LEFT JOIN "{schema}"."{target_table_name}" target ON {join_on_clause}
+                    GROUP BY raw.ctid, {select_raw_columns}
+                """
 
-                    -- Identify rows to keep and update skip reasons
-                    final_selection AS (
-                        SELECT *,
-                               CASE
-                                   WHEN row_rank = 1 THEN NULL  -- Keep these rows
-                                   ELSE 'duplicate_source_rows'  -- Skip these rows
-                               END AS final_skip_reason
-                        FROM ranked
-                    )
+                conn.execute(text(create_conflicts_sql))
 
-                    -- Update skip reasons for all rows first
+                # Step 2: Mark rows with multiple target conflicts
+                mark_multiple_conflicts_sql = f"""
                     UPDATE "{raw_table_name}"
-                    SET skip_reason = COALESCE(
-                        (SELECT 'multiple_target_conflicts' FROM raw_with_conflicts
-                         WHERE raw_with_conflicts.ctid = "{raw_table_name}".ctid
-                         AND conflict_targets > 1),
-                        (SELECT final_skip_reason FROM final_selection
-                         WHERE final_selection.ctid = "{raw_table_name}".ctid)
+                    SET skip_reason = 'multiple_target_conflicts'
+                    WHERE ctid IN (
+                        SELECT raw_ctid FROM "{conflicts_table}"
+                        WHERE conflict_count > 1
                     )
                 """
 
-                logger.debug(f"Generated UPDATE SQL: {solve_conflicts_sql}")
+                conn.execute(text(mark_multiple_conflicts_sql))
 
-                # Execute the update for skip reasons
-                with self.engine.begin() as conn:
-                    conn.execute(text(solve_conflicts_sql))
+                # Step 3: Handle duplicate source rows (keep only the last one per target)
+                mark_duplicates_sql = f"""
+                    UPDATE "{raw_table_name}"
+                    SET skip_reason = 'duplicate_source_rows'
+                    WHERE ctid IN (
+                        SELECT c1.raw_ctid
+                        FROM "{conflicts_table}" c1
+                        JOIN "{conflicts_table}" c2 ON (
+                            c1.target_ctid = c2.target_ctid
+                            AND c1.raw_ctid < c2.raw_ctid
+                        )
+                        WHERE c1.conflict_count <= 1 AND c2.conflict_count <= 1
+                    )
+                """
 
-            logger.debug(f"Solved conflicts and updated table column '{raw_table_name}.skip_reason'")
+                conn.execute(text(mark_duplicates_sql))
 
-            return None
+                # Step 4: Mark remaining rows as accepted (skip_reason = NULL)
+                mark_accepted_sql = f"""
+                    UPDATE "{raw_table_name}"
+                    SET skip_reason = NULL
+                    WHERE skip_reason IS NULL
+                """
+
+                conn.execute(text(mark_accepted_sql))
+
+                # Clean up temporary conflicts table
+                conn.execute(text(f'DROP TABLE IF EXISTS "{conflicts_table}"'))
+
+            logger.debug(f"Solved conflicts using optimized approach for '{raw_table_name}'")
 
         except Exception as e:
             logger.error(f"Failed to solve conflicts: {e}")
@@ -732,12 +719,12 @@ class PostgresqlUpsert:
                 pbar.update(1)
                 pbar.set_description("Resolved conflicts")
 
-                # Step 3: Populate clean temp table with conflict resolution
+                # Step 4: Populate clean temp table with conflict resolution
                 clean_rows_count = self._populate_clean_temp_table(raw_table_name, clean_table_name)
                 pbar.update(1)
                 pbar.set_description("Populated clean temporary table")
 
-                # Step 4: Get skipped rows if requested
+                # Step 5: Get skipped rows if requested
                 if return_skipped:
                     skipped_df = self._get_skipped_rows(raw_table_name)
                     pbar.update(1)
@@ -745,7 +732,7 @@ class PostgresqlUpsert:
                 else:
                     pbar.update(1)
 
-                # Step 5: Execute MERGE operation
+                # Step 6: Execute MERGE operation
                 affected_rows = self._merge_from_clean_temp_table(clean_table_name, table_name, schema)
                 pbar.update(1)
                 pbar.set_description("Executed MERGE")
