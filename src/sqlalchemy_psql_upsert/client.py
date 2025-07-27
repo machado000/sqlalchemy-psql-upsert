@@ -331,7 +331,7 @@ class PostgresqlUpsert:
 
             # Use single connection for all batches to reduce overhead
             with self.engine.begin() as conn:
-                with tqdm(total=total_rows, desc=f"{"Inserting raw data":>25}", unit="rows") as pbar:
+                with tqdm(total=total_rows, desc=f'{"Inserting raw data":>25}', unit="rows") as pbar:
                     for start_idx in range(0, total_rows, batch_size):
                         end_idx = min(start_idx + batch_size, total_rows)
                         batch_df = dataframe.iloc[start_idx:end_idx]
@@ -737,38 +737,38 @@ class PostgresqlUpsert:
                 # Step 1: Create both temporary tables
                 raw_table_name, clean_table_name = self._create_temp_tables(dataframe, table_name, schema)
                 pbar.update(1)
-                pbar.set_description(f"{"Created temporary tables":>25}")
+                pbar.set_description(f'{"Created temporary tables":>25}')
 
                 # Step 2: Insert data into raw temp table
                 self._batch_insert_dataframe(dataframe, raw_table_name, schema=None)
                 pbar.update(1)
-                pbar.set_description(f"{"Loaded raw data":>25}")
+                pbar.set_description(f'{"Loaded raw data":>25}')
 
                 # Step 3: Populate clean temp table with conflict resolution
                 self._solve_constraint_conflicts(raw_table_name, table_name, schema)
                 pbar.update(1)
-                pbar.set_description(f"{"Resolved conflicts":>25}")
+                pbar.set_description(f'{"Resolved conflicts":>25}')
 
                 # Step 4: Populate clean temp table with conflict resolution
                 clean_rows_count = self._populate_clean_temp_table(raw_table_name, clean_table_name)
                 pbar.update(1)
-                pbar.set_description(f"{"Populated clean table":>25}")
+                pbar.set_description(f'{"Populated clean table":>25}')
 
                 # Step 5: Get skipped rows if requested
                 if return_skipped:
                     skipped_df = self._get_skipped_rows(raw_table_name)
                     pbar.update(1)
-                    pbar.set_description(f"{"Fetch skipped rows":>25}")
+                    pbar.set_description(f'{"Fetch skipped rows":>25}')
                 else:
                     pbar.update(1)
 
                 # Step 6: Execute MERGE operation
                 affected_rows = self._merge_from_clean_temp_table(clean_table_name, table_name, schema)
                 pbar.update(1)
-                pbar.set_description(f"{"Executed MERGE":>25}")
+                pbar.set_description(f'{"Executed MERGE":>25}')
 
                 pbar.update(1)
-                pbar.set_description(f"{"Completed successfully":>25}")
+                pbar.set_description(f'{"Completed successfully":>25}')
 
             logger.info(f"Upsert completed: {affected_rows} rows affected, "
                         f"{len(dataframe) - clean_rows_count} rows skipped")
