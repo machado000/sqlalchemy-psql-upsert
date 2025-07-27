@@ -5,19 +5,20 @@
 [![Issues](https://img.shields.io/github/issues/machado000/sqlalchemy-psql-upsert)](https://github.com/machado000/sqlalchemy-psql-upsert/issues)
 [![Last Commit](https://img.shields.io/github/last-commit/machado000/sqlalchemy-psql-upsert)](https://github.com/machado000/sqlalchemy-psql-upsert/commits/main)
 
-A high-performance Python library for PostgreSQL UPSERT operations with intelligent conflict resolution using temporary tables and advanced CTE algorithm.
+
+A high-performance Python library for PostgreSQL UPSERT operations with intelligent conflict resolution using PostgreSQL temporary tables and atomic MERGE statements. Designed for reliability, data integrity, and modern Python development.
 
 
 ## 🚀 Features
 
-- **Temporary Table Strategy**: Uses PostgreSQL temporary tables for efficient staging and conflict analysis
-- **Advanced CTE Logic**: Sophisticated Common Table Expression queries for multi-constraint conflict resolution
-- **Atomic MERGE Operations**: Single-transaction upserts using PostgreSQL 15+ MERGE statements
+- **Temporary Table Staging**: Uses PostgreSQL temporary tables for efficient, isolated staging and conflict analysis
+- **Atomic MERGE Operations**: Single-transaction upserts using PostgreSQL 15+ MERGE statements for reliability and performance
 - **Multi-constraint Support**: Handles primary keys, unique constraints, and composite constraints simultaneously
 - **Intelligent Conflict Resolution**: Automatically filters ambiguous conflicts and deduplicates data
-- **Automatic NaN to NULL Conversion**: Seamlessly converts pandas NaN values to PostgreSQL NULL values
+- **Automatic NaN to NULL Conversion**: Seamlessly converts pandas NaN/None values to PostgreSQL NULL values
 - **Schema Validation**: Automatic table and column validation before operations
 - **Comprehensive Logging**: Detailed debug information and progress tracking
+- **Modern Typing**: Fully typed with Python 3.10+ type hints
 
 
 ## 📦 Installation
@@ -36,7 +37,7 @@ pip install sqlalchemy-psql-upsert
 
 ### Database Privileges Requirements
 
-Besides SELECT, INSERT, UPDATE permissions on target tables, this library requires  PostgreSQL `TEMPORARY` privilege to function properly:
+Besides SELECT, INSERT, UPDATE permissions on target tables, this library requires PostgreSQL `TEMPORARY` privilege to function properly:
 
 **Why Temporary Tables?**
 - **Isolation**: Staging data doesn't interfere with production tables during analysis
@@ -193,112 +194,43 @@ upserter.upsert_dataframe(df, 'users')
 
 ## 🔍 How It Works
 
-### Overview: Temporary Table + CTE + MERGE Strategy
 
-This library uses a sophisticated 3-stage approach for reliable, high-performance upserts:
+### Detailed Upsert Workflow
 
-1. **Temporary Table Staging**: Data is first loaded into a PostgreSQL temporary table
-2. **CTE-based Conflict Analysis**: Advanced Common Table Expressions analyze and resolve conflicts
-3. **Atomic MERGE Operation**: Single transaction applies all changes using PostgreSQL MERGE
+This library uses a robust multi-step approach for reliable, high-performance upserts:
 
-### Stage 1: Temporary Table Creation
+1. **Temporary Table Staging**
+   - A temporary table is created with the same structure as the target table, plus a `skip_reason` column.
+   - All input DataFrame rows are bulk inserted into this table.
 
-```sql
--- Creates a temporary table with identical structure to target table
-CREATE TEMP TABLE "temp_upsert_12345678" (
-    id INTEGER,
-    email VARCHAR,
-    doc_type VARCHAR,
-    doc_number VARCHAR
-);
+2. **Multi-Row Conflict Detection**
+   - Each row in the temp table is checked for conflicts against the target table's constraints (PK, unique, composite unique).
+   - Rows that would conflict with more than one target row are marked with `skip_reason = 'multiple_target_conflicts'`.
 
--- Bulk insert all DataFrame data into temporary table
-INSERT INTO "temp_upsert_12345678" VALUES (...);
-```
+3. **Ranking and Deduplication**
+   - For rows that only conflict with a single target row, the library checks for duplicate source rows (multiple input rows targeting the same record).
+   - Only the last row for each target is kept; others are marked with `skip_reason = 'duplicate_source_rows'`.
 
-**Benefits:**
-- ✅ Isolates staging data from target table
-- ✅ Enables complex analysis without affecting production data
-- ✅ Automatic cleanup when session ends
-- ✅ High-performance bulk inserts
+4. **Constructing the Clean Rows Table**
+   - A second temporary table (the "clean table") is created with the same structure as the target table.
+   - All rows from the raw temp table where `skip_reason IS NULL` are copied into the clean table.
 
-### Stage 2: CTE-based Conflict Analysis
+5. **Merging Clean Table into Target Table**
+   - A single, atomic PostgreSQL `MERGE` statement is executed:
+     - If a row in the clean table matches a row in the target table (by any constraint), it is updated.
+     - If there is no match, the row is inserted.
 
-The library generates sophisticated CTEs to handle complex conflict scenarios:
+6. **Fetching and Returning Conflicts**
+   - After the merge, all rows from the raw temp table where `skip_reason IS NOT NULL` are fetched and returned to the user, along with the reason they were skipped.
 
-```sql
-WITH temp_with_conflicts AS (
-    -- Analyze each temp row against ALL constraints simultaneously
-    SELECT temp.*, temp.ctid,
-           COUNT(DISTINCT target.id) AS conflict_targets,
-           MAX(target.id) AS conflicted_target_id
-    FROM "temp_upsert_12345678" temp
-    LEFT JOIN "public"."target_table" target
-      ON (temp.id = target.id) OR              -- PK conflict
-         (temp.email = target.email) OR        -- Unique conflict
-         (temp.doc_type = target.doc_type AND  -- Composite unique conflict
-          temp.doc_number = target.doc_number)
-    GROUP BY temp.ctid, temp.id, temp.email, temp.doc_type, temp.doc_number
-),
-filtered AS (
-    -- Filter out rows that conflict with multiple target rows (ambiguous)
-    SELECT * FROM temp_with_conflicts
-    WHERE conflict_targets <= 1
-),
-ranked AS (
-    -- Deduplicate temp rows targeting the same existing row
-    SELECT *,
-           ROW_NUMBER() OVER (
-               PARTITION BY COALESCE(conflicted_target_id, id)
-               ORDER BY ctid DESC
-           ) AS row_rank
-    FROM filtered
-),
-clean_rows AS (
-    -- Final dataset: only the latest row per target
-    SELECT id, email, doc_type, doc_number
-    FROM ranked
-    WHERE row_rank = 1
-)
--- Ready for MERGE...
-```
+This process ensures only valid, deduplicated rows are upserted, and all conflicts are tracked and reported for further review.
 
-**CTE Logic Breakdown:**
-
-1. **`temp_with_conflicts`**: Joins temporary table against target table using ALL constraints simultaneously, counting how many existing rows each temp row conflicts with.
-
-2. **`filtered`**: Removes ambiguous rows that would conflict with multiple existing records (keeps rows with conflict_targets <= 1) - [ _1 to many conflict_ ].
-
-3. **`ranked`**: When multiple temp rows target the same existing record, rank these based on descend insertion order using table ctid - [ _many to 1 conflict_ ].
-
-4. **`clean_rows`**: Keps only the last row inserted for each conflict. Final clean dataset ready for atomic upsert.
-
-### Stage 3: Atomic MERGE Operation
-
-```sql
-MERGE INTO "public"."target_table" AS tgt
-USING clean_rows AS src
-ON (tgt.id = src.id) OR 
-   (tgt.email = src.email) OR 
-   (tgt.doc_type = src.doc_type AND tgt.doc_number = src.doc_number)
-WHEN MATCHED THEN
-    UPDATE SET email = src.email, doc_type = src.doc_type, doc_number = src.doc_number
-WHEN NOT MATCHED THEN
-    INSERT (id, email, doc_type, doc_number)
-    VALUES (src.id, src.email, src.doc_type, src.doc_number);
-```
-
-**Benefits:**
-- ✅ Single atomic transaction
-- ✅ Handles all conflict types simultaneously
-- ✅ Automatic INSERT or UPDATE decision
-- ✅ No race conditions or partial updates
 
 ### Constraint Detection
 
 The library automatically analyzes your target table to identify:
 - **Primary key constraints**: Single or composite primary keys
-- **Unique constraints**: Single column unique constraints  
+- **Unique constraints**: Single column unique constraints
 - **Composite unique constraints**: Multi-column unique constraints
 
 All constraint types are handled simultaneously in a single operation.

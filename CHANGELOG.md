@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2025-07-27
+
+### Added
+- **Python 3.10+ Required**: Dropped support for Python 3.9, now requires Python 3.10 or newer.
+- **PEP 561 Typing Support**: Added `py.typed` marker and modern type hints throughout the codebase.
+- **Strict Type Checking**: CI now enforces strict type checking with mypy on every commit and pull request.
+- **Improved Documentation**: Updated README and docstrings for clarity, modern usage, and PyPI polish.
+- **CI Improvements**: GitHub Actions workflow now tests across Python 3.10–3.13, runs mypy, pytest, and syntax checks.
+
+### Changed
+- **README**: Removed outdated references to CTE-based logic, clarified temporary table + MERGE architecture, and modernized feature list.
+- **Type Hints**: Upgraded all type hints to Python 3.10+ syntax (e.g., `list[str]`, `tuple[str, str]`).
+- **Project Structure**: Moved typing validation script to `tests/` for better organization.
+
+### Fixed
+- **Type Checking Errors**: Fixed all mypy errors and ensured 100% type coverage.
+
 ## [1.1.0]
 
 ### Changed
