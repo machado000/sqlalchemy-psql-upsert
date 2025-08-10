@@ -51,7 +51,7 @@ requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
-packages = [{ include = "sqlalchemy_psql_upsert", from = "src" }]
+packages = [{ include = "sqlalchemy_psql_upsert"}]
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.0.0"
