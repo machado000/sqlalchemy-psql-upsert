@@ -89,6 +89,114 @@ class PostgresqlUpsert:
         logger.debug(f"Creating new database engine with URI: {uri}")
         return create_engine(uri)
 
+    def upsert_dataframe(self, dataframe: pd.DataFrame, table_name: str, schema: str = "public",
+                         return_skipped: bool = False) -> Union[int, tuple[int, pd.DataFrame]]:
+        """
+        Upsert a pandas DataFrame into a PostgreSQL table using dual temporary table approach.
+
+        This method automatically handles:
+        - Multiple constraint conflicts using temporary table approach
+        - Comprehensive NaN value conversion: All pandas NaN values and string representations
+          ("nan", "null", "none", empty strings) are converted to PostgreSQL NULL
+        - Efficient bulk operations with conflict resolution
+        - Optional return of skipped rows for analysis
+
+        Args:
+            dataframe: Input DataFrame to upsert
+            table_name: Target table name in the database
+            schema: Database schema name (default: "public")
+            return_skipped: If True, returns DataFrame with skipped rows (default: False)
+
+        Returns:
+            int: Number of affected rows in the target table
+            tuple[int, pd.DataFrame]: When return_skipped=True, returns (affected_rows, skipped_rows_df)
+
+        Raises:
+            ValueError: If table doesn't exist or other validation errors
+            Exception: For database connection, transient, or processing errors
+        """
+        skipped_df = pd.DataFrame()
+
+        if dataframe.empty or dataframe is None:
+            logger.warning("Received empty DataFrame. Skipping upsert.")
+            return (0, skipped_df) if return_skipped else 0
+
+        logger.info(f"Starting upsert operation for {len(dataframe)} rows into {schema}.{table_name}")
+
+        # Validate target table exists
+        inspector = inspect(self.engine)
+        if table_name not in inspector.get_table_names(schema=schema):
+            error_msg = f"Destination table '{schema}.{table_name}' not found."
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+
+        # Get constraints
+        pk_cols, uniques = self._get_constraints(table_name, schema)
+
+        if not pk_cols and not uniques:
+            logger.info("No PK or UNIQUE constraints found, loading data using INSERT with no conflict resolution.")
+
+            affected_rows = self._batch_insert_dataframe(dataframe, table_name, schema)
+
+            return (affected_rows, skipped_df) if return_skipped else affected_rows
+
+        logger.info(f"Found constraints: PK={pk_cols}, Uniques={uniques}")
+
+        raw_table_name = None
+        clean_table_name = None
+
+        try:
+            with tqdm(total=6, desc="Processing upsert", unit="step") as pbar:
+                # Step 1: Create both temporary tables
+                raw_table_name, clean_table_name = self._create_temp_tables(dataframe, table_name, schema)
+                pbar.update(1)
+                pbar.set_description(f'{"Created temporary tables":>25}')
+
+                # Step 2: Insert data into raw temp table
+                self._batch_insert_dataframe(dataframe, raw_table_name, schema=None)
+                pbar.update(1)
+                pbar.set_description(f'{"Loaded raw data":>25}')
+
+                # Step 3: Populate clean temp table with conflict resolution
+                self._solve_constraint_conflicts(raw_table_name, table_name, schema)
+                pbar.update(1)
+                pbar.set_description(f'{"Resolved conflicts":>25}')
+
+                # Step 4: Populate clean temp table with conflict resolution
+                clean_rows_count = self._populate_clean_temp_table(raw_table_name, clean_table_name)
+                pbar.update(1)
+                pbar.set_description(f'{"Populated clean table":>25}')
+
+                # Step 5: Get skipped rows if requested
+                if return_skipped:
+                    skipped_df = self._get_skipped_rows(raw_table_name)
+                    pbar.update(1)
+                    pbar.set_description(f'{"Fetch skipped rows":>25}')
+                else:
+                    pbar.update(1)
+
+                # Step 6: Execute MERGE operation
+                affected_rows = self._merge_from_clean_temp_table(clean_table_name, table_name, schema)
+                pbar.update(1)
+                pbar.set_description(f'{"Executed MERGE":>25}')
+
+                pbar.update(1)
+                pbar.set_description(f'{"Completed successfully":>25}')
+
+            logger.info(f"Upsert completed: {affected_rows} rows affected, "
+                        f"{len(dataframe) - clean_rows_count} rows skipped")
+
+            return (affected_rows, skipped_df) if return_skipped else affected_rows
+
+        except Exception as e:
+            logger.error(f"Upsert operation failed: {e}")
+            raise
+
+        finally:
+            # Always cleanup temp tables if they exist
+            if raw_table_name or clean_table_name:
+                self._cleanup_temp_tables(raw_table_name, clean_table_name)
+
     def _list_tables(self) -> list[str]:
         """
         Get a list of all table names in the database.
@@ -675,111 +783,3 @@ class PostgresqlUpsert:
 
         except Exception as e:
             logger.error(f"Failed to cleanup temporary tables: {e}")
-
-    def upsert_dataframe(self, dataframe: pd.DataFrame, table_name: str, schema: str = "public",
-                         return_skipped: bool = False) -> Union[int, tuple[int, pd.DataFrame]]:
-        """
-        Upsert a pandas DataFrame into a PostgreSQL table using dual temporary table approach.
-
-        This method automatically handles:
-        - Multiple constraint conflicts using temporary table approach
-        - Comprehensive NaN value conversion: All pandas NaN values and string representations
-          ("nan", "null", "none", empty strings) are converted to PostgreSQL NULL
-        - Efficient bulk operations with conflict resolution
-        - Optional return of skipped rows for analysis
-
-        Args:
-            dataframe: Input DataFrame to upsert
-            table_name: Target table name in the database
-            schema: Database schema name (default: "public")
-            return_skipped: If True, returns DataFrame with skipped rows (default: False)
-
-        Returns:
-            int: Number of affected rows in the target table
-            tuple[int, pd.DataFrame]: When return_skipped=True, returns (affected_rows, skipped_rows_df)
-
-        Raises:
-            ValueError: If table doesn't exist or other validation errors
-            Exception: For database connection, transient, or processing errors
-        """
-        skipped_df = pd.DataFrame()
-
-        if dataframe.empty or dataframe is None:
-            logger.warning("Received empty DataFrame. Skipping upsert.")
-            return (0, skipped_df) if return_skipped else 0
-
-        logger.info(f"Starting upsert operation for {len(dataframe)} rows into {schema}.{table_name}")
-
-        # Validate target table exists
-        inspector = inspect(self.engine)
-        if table_name not in inspector.get_table_names(schema=schema):
-            error_msg = f"Destination table '{schema}.{table_name}' not found."
-            logger.error(error_msg)
-            raise ValueError(error_msg)
-
-        # Get constraints
-        pk_cols, uniques = self._get_constraints(table_name, schema)
-
-        if not pk_cols and not uniques:
-            logger.info("No PK or UNIQUE constraints found, loading data using INSERT with no conflict resolution.")
-
-            affected_rows = self._batch_insert_dataframe(dataframe, table_name, schema)
-
-            return (affected_rows, skipped_df) if return_skipped else affected_rows
-
-        logger.info(f"Found constraints: PK={pk_cols}, Uniques={uniques}")
-
-        raw_table_name = None
-        clean_table_name = None
-
-        try:
-            with tqdm(total=6, desc="Processing upsert", unit="step") as pbar:
-                # Step 1: Create both temporary tables
-                raw_table_name, clean_table_name = self._create_temp_tables(dataframe, table_name, schema)
-                pbar.update(1)
-                pbar.set_description(f'{"Created temporary tables":>25}')
-
-                # Step 2: Insert data into raw temp table
-                self._batch_insert_dataframe(dataframe, raw_table_name, schema=None)
-                pbar.update(1)
-                pbar.set_description(f'{"Loaded raw data":>25}')
-
-                # Step 3: Populate clean temp table with conflict resolution
-                self._solve_constraint_conflicts(raw_table_name, table_name, schema)
-                pbar.update(1)
-                pbar.set_description(f'{"Resolved conflicts":>25}')
-
-                # Step 4: Populate clean temp table with conflict resolution
-                clean_rows_count = self._populate_clean_temp_table(raw_table_name, clean_table_name)
-                pbar.update(1)
-                pbar.set_description(f'{"Populated clean table":>25}')
-
-                # Step 5: Get skipped rows if requested
-                if return_skipped:
-                    skipped_df = self._get_skipped_rows(raw_table_name)
-                    pbar.update(1)
-                    pbar.set_description(f'{"Fetch skipped rows":>25}')
-                else:
-                    pbar.update(1)
-
-                # Step 6: Execute MERGE operation
-                affected_rows = self._merge_from_clean_temp_table(clean_table_name, table_name, schema)
-                pbar.update(1)
-                pbar.set_description(f'{"Executed MERGE":>25}')
-
-                pbar.update(1)
-                pbar.set_description(f'{"Completed successfully":>25}')
-
-            logger.info(f"Upsert completed: {affected_rows} rows affected, "
-                        f"{len(dataframe) - clean_rows_count} rows skipped")
-
-            return (affected_rows, skipped_df) if return_skipped else affected_rows
-
-        except Exception as e:
-            logger.error(f"Upsert operation failed: {e}")
-            raise
-
-        finally:
-            # Always cleanup temp tables if they exist
-            if raw_table_name or clean_table_name:
-                self._cleanup_temp_tables(raw_table_name, clean_table_name)
