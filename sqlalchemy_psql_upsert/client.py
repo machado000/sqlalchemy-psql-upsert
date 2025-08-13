@@ -169,7 +169,9 @@ class PostgresqlUpsert:
 
                 # Step 5: Get skipped rows if requested
                 if return_skipped:
-                    skipped_df = self._get_skipped_rows(raw_table_name) or pd.DataFrame()
+                    skipped_df = self._get_skipped_rows(raw_table_name)
+                    if skipped_df is None:
+                        skipped_df = pd.DataFrame()
                     pbar.update(1)
                     pbar.set_description(f'{"Fetch skipped rows":>25}')
                 else:
