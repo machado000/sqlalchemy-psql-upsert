@@ -78,6 +78,7 @@ def test_connection(config: Optional[PgConfig] = None, engine: Optional[Engine] 
 __all__ = [
     "PostgresqlUpsert",
     "PgConfig",
+    "create_engine",
     "setup_logging",
     "test_connection",
 ]
