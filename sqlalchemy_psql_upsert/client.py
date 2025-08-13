@@ -31,7 +31,7 @@ import uuid
 from sqlalchemy import create_engine, inspect, text, insert
 from sqlalchemy import Engine, MetaData, Table, UniqueConstraint, Column, Text
 from tqdm import tqdm
-from typing import Optional, Union, Any
+from typing import Optional, Any
 from .config import PgConfig
 
 logger = logging.getLogger(__name__)
@@ -90,7 +90,7 @@ class PostgresqlUpsert:
         return create_engine(uri)
 
     def upsert_dataframe(self, dataframe: pd.DataFrame, table_name: str, schema: str = "public",
-                         return_skipped: bool = False) -> Union[int, tuple[int, pd.DataFrame]]:
+                         return_skipped: bool = False) -> int | tuple[int, pd.DataFrame]:
         """
         Upsert a pandas DataFrame into a PostgreSQL table using dual temporary table approach.
 
@@ -169,7 +169,7 @@ class PostgresqlUpsert:
 
                 # Step 5: Get skipped rows if requested
                 if return_skipped:
-                    skipped_df = self._get_skipped_rows(raw_table_name)
+                    skipped_df = self._get_skipped_rows(raw_table_name) or pd.DataFrame()
                     pbar.update(1)
                     pbar.set_description(f'{"Fetch skipped rows":>25}')
                 else:
@@ -663,7 +663,7 @@ class PostgresqlUpsert:
                 return pd.DataFrame(columns=columns)
 
             # Convert to DataFrame with column names from result
-            skipped_df = pd.DataFrame(rows, columns=result.keys())
+            skipped_df = pd.DataFrame(rows, columns=list(result.keys()))
 
             logger.debug(f"Found {len(skipped_df)} skipped rows with detailed reasons")
             return skipped_df
