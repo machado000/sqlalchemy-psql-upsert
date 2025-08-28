@@ -43,15 +43,28 @@ jobs:
         virtualenvs-create: true
         virtualenvs-in-project: true
     
+    - name: Configure Poetry
+      run: |
+        poetry config installer.max-workers 1
+        poetry config installer.no-binary greenlet
+    
     - name: Load cached venv
       id: cached-poetry-dependencies
       uses: actions/cache@v4
       with:
         path: .venv
-        key: venv-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('**/poetry.lock') }}
+        key: venv-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('**/poetry.lock') }}-v2
     
     - name: Install dependencies
-      run: poetry install --with dev
+      run: |
+        poetry lock --no-cache
+        poetry install --with dev --no-cache || {
+          echo "Poetry install failed, trying with pip fallback for greenlet"
+          poetry run pip install --no-binary greenlet greenlet
+          poetry install --with dev --no-cache
+        }
+      env:
+        PIP_NO_BINARY: greenlet
     
     - name: Run type checking with mypy
       run: poetry run mypy sqlalchemy_psql_upsert/
