@@ -1,10 +1,11 @@
-import pytest
+import logging
 import pandas as pd
-from sqlalchemy import create_engine, text
-from sqlalchemy import Table, Column, Integer, String, MetaData, UniqueConstraint
+import pytest
+
+from sqlalchemy import Engine, Table, Column, Integer, String, MetaData, UniqueConstraint, create_engine, text
 from sqlalchemy_psql_upsert.client import PostgresqlUpsert
 from testcontainers.postgres import PostgresContainer
-import logging
+from typing import Generator
 
 # Configure logging to show debug messages during tests
 logging.basicConfig(
@@ -20,7 +21,7 @@ logger.propagate = True
 
 
 @pytest.fixture(scope="module")
-def pg_engine():
+def pg_engine() -> Generator[Engine, None, None]:
     with PostgresContainer("postgres:15") as pg:
         engine = create_engine(pg.get_connection_url())
         metadata = MetaData()
@@ -38,13 +39,13 @@ def pg_engine():
 
 
 @pytest.fixture(scope="module")
-def upserter(pg_engine):
+def upserter(pg_engine: Engine) -> PostgresqlUpsert:
     # Initialize with debug=True to enable debug logging
     return PostgresqlUpsert(engine=pg_engine, debug=False)
 
 
 @pytest.fixture(scope="function")
-def populated_table(pg_engine):
+def populated_table(pg_engine: Engine) -> Generator[None, None, None]:
     initial_data = pd.DataFrame([
         {"id": 1, "email": "a@x.com", "doc_type": "CPF", "doc_number": "901", "count_number": 0},
         {"id": 2, "email": "b@x.com", "doc_type": "RG",  "doc_number": "902", "count_number": 0},
@@ -63,7 +64,7 @@ def populated_table(pg_engine):
 
 
 @pytest.fixture(scope="function")
-def test_df():
+def test_df() -> Generator[pd.DataFrame, None, None]:
     test_df = pd.DataFrame([
         {"id": 1, "email": "a@x.com", "doc_type": "CPF", "doc_number": "911", "count_number": 108},
         {"id": 2, "email": "b@x.com", "doc_type": "RG",  "doc_number": "912", "count_number": 140},
@@ -89,7 +90,7 @@ def test_df():
     yield test_df
 
 
-def test_get_constraints(upserter, populated_table):
+def test_get_constraints(upserter: PostgresqlUpsert, populated_table: None) -> None:
     table_name = "target_table"
 
     pk, uniques = upserter._get_constraints(table_name)
@@ -100,7 +101,7 @@ def test_get_constraints(upserter, populated_table):
         upserter._get_constraints("nonexistent_table")
 
 
-def test_get_dataframe_constraints(upserter, test_df):
+def test_get_dataframe_constraints(upserter: PostgresqlUpsert, test_df: pd.DataFrame) -> None:
     table_name = "target_table"
     empty_df = pd.DataFrame()
 
@@ -116,11 +117,13 @@ def test_get_dataframe_constraints(upserter, test_df):
         upserter._get_dataframe_constraints(test_df, "nonexistent_table")
 
 
-def test_upsert_dataframe(upserter, populated_table, test_df):
+def test_upsert_dataframe(upserter: PostgresqlUpsert, populated_table: None, test_df: pd.DataFrame) -> None:
     table_name = "target_table"
 
     # Test with return_skipped=True (should return tuple)
-    count_affected_rows, skipped_rows_df = upserter.upsert_dataframe(test_df, table_name, return_skipped=True)
+    result = upserter.upsert_dataframe(test_df, table_name, return_skipped=True)
+    assert isinstance(result, tuple)
+    count_affected_rows, skipped_rows_df = result
 
     logger.info(f"Affected rows: {count_affected_rows}, Skipped rows: {len(skipped_rows_df)}")
 
@@ -128,11 +131,13 @@ def test_upsert_dataframe(upserter, populated_table, test_df):
 
     # Test with empty DataFrame and return_skipped=False (should return single integer)
     empty_df = pd.DataFrame()
-    count_affected_rows = upserter.upsert_dataframe(empty_df, table_name, return_skipped=False)
+    empty_result = upserter.upsert_dataframe(empty_df, table_name, return_skipped=False)
+    assert isinstance(empty_result, int)
+    count_affected_rows_empty = empty_result
 
-    logger.info(f"Empty DataFrame affected rows: {count_affected_rows}")
+    logger.info(f"Empty DataFrame affected rows: {count_affected_rows_empty}")
 
-    assert count_affected_rows == 0
+    assert count_affected_rows_empty == 0
 
     # Test with nonexistent table
     with pytest.raises(Exception):

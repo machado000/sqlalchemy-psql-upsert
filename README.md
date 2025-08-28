@@ -7,7 +7,7 @@
 [![CI](https://github.com/machado000/sqlalchemy-psql-upsert/actions/workflows/ci.yml/badge.svg)](https://github.com/machado000/sqlalchemy-psql-upsert/actions/workflows/ci.yml)
 
 
-A high-performance Python library for PostgreSQL UPSERT operations with intelligent conflict resolution using PostgreSQL temporary tables and atomic MERGE statements. Designed for reliability, data integrity, and modern Python development.
+A high-performance Python library for PostgreSQL UPSERT operations with intelligent conflict resolution using PostgreSQL temporary tables and atomic MERGE statements. Designed for reliability, data integrity, and modern Python development with comprehensive type safety.
 
 
 ## 🚀 Features
@@ -19,7 +19,8 @@ A high-performance Python library for PostgreSQL UPSERT operations with intellig
 - **Automatic NaN to NULL Conversion**: Seamlessly converts pandas NaN/None values to PostgreSQL NULL values
 - **Schema Validation**: Automatic table and column validation before operations
 - **Comprehensive Logging**: Detailed debug information and progress tracking
-- **Modern Typing**: Fully typed with Python 3.10+ type hints
+- **Modern Typing**: Fully typed with Python 3.10+ type hints and strict mypy compliance
+- **Type Safety**: 100% type coverage with comprehensive type annotations
 
 
 ## 📦 Installation
@@ -146,13 +147,25 @@ df = pd.DataFrame({
 })
 
 # Perform upsert
-success, affected_rows = upserter.upsert_dataframe(
+affected_rows = upserter.upsert_dataframe(
     dataframe=df,
     table_name='users',
     schema='public'
 )
 
 print(f"✅ Upserted {affected_rows} rows successfully")
+
+# Get detailed information about skipped rows
+affected_rows, skipped_df = upserter.upsert_dataframe(
+    dataframe=df,
+    table_name='users', 
+    schema='public',
+    return_skipped=True
+)
+
+print(f"✅ Upserted {affected_rows} rows, {len(skipped_df)} rows skipped")
+if not skipped_df.empty:
+    print("Skipped rows:", skipped_df[['skip_reason']].value_counts())
 ```
 
 ### Advanced Configuration
@@ -165,7 +178,7 @@ engine = create_engine('postgresql://user:pass@localhost:5432/mydb')
 upserter = PostgresqlUpsert(engine=engine, debug=True)
 
 # Upsert with custom schema
-success, affected_rows = upserter.upsert_dataframe(
+affected_rows = upserter.upsert_dataframe(
     dataframe=large_df,
     table_name='products',
     schema='inventory'
@@ -292,8 +305,8 @@ def chunk_dataframe(df, chunk_size=50000):
 
 # Process in manageable chunks
 for chunk in chunk_dataframe(large_df):
-    success, rows = upserter.upsert_dataframe(chunk, 'target_table')
-    print(f"Processed chunk: {rows} rows")
+    affected_rows = upserter.upsert_dataframe(chunk, 'target_table')
+    print(f"Processed chunk: {affected_rows} rows")
 ```
 
 **Performance Optimization:**
@@ -309,7 +322,7 @@ upserter = PostgresqlUpsert(engine=engine, debug=True)
 **Error Handling:**
 ```python
 try:
-    success, affected_rows = upserter.upsert_dataframe(df, 'users')
+    affected_rows = upserter.upsert_dataframe(df, 'users')
     logger.info(f"Successfully upserted {affected_rows} rows")
 except ValueError as e:
     logger.error(f"Validation error: {e}")

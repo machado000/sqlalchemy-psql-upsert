@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.2] - 2025-08-28
+
+### Fixed
+- **Type Checking Errors**: Fixed all mypy errors in test files with proper type annotations
+- **DataFrame Ambiguity Error**: Fixed "The truth value of a DataFrame is ambiguous" error by replacing problematic `or` usage with explicit None checks
+- **Return Type Annotations**: Enhanced return type hints for better type safety and IDE support
+
+### Changed
+- **Test Type Safety**: Added comprehensive type annotations to all test functions and fixtures
+- **Code Quality**: Improved type checking compliance across the entire codebase
+
 ## [1.2.0] - 2025-07-27
 
 ### Added
