@@ -5,7 +5,7 @@ description = "PostgreSQL upsert library with intelligent conflict resolution an
 authors = [{name = "Joao Brito"}]
 readme = "README.md"
 license = {text = "GPL-3.0"}
-requires-python = ">=3.10,<=3.13"
+requires-python = ">=3.11,<=3.13"
 keywords = [
     "postgresql", 
     "upsert", 
@@ -23,7 +23,6 @@ classifiers = [
     "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -58,7 +57,7 @@ testcontainers = {extras = ["postgresql"], version = "^4.0.0"}
 mypy = "^1.17.0"
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.11"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
